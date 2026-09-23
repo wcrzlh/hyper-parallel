@@ -180,9 +180,9 @@ class TextTrainer:
         """Dispatch the epoch-end lifecycle hook."""
         self.base.on_epoch_end()
 
-    def on_step_begin(self) -> None:
-        """Dispatch the step-begin lifecycle hook."""
-        self.base.on_step_begin()
+    def on_step_begin(self, micro_batches: Any = None) -> None:
+        """Dispatch the step-begin lifecycle hook with metric inputs."""
+        self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(
             self,
@@ -229,7 +229,9 @@ class TextTrainer:
             for name, token_count in count_loss_token(loss_inputs).items():
                 self.base.step_token_counts[name] += token_count
 
-        self.on_step_begin()
+        self.on_step_begin(
+            micro_batches=[loss_inputs for _, loss_inputs in training_batches]
+        )
         synchronize()
 
         total_loss = 0.0
