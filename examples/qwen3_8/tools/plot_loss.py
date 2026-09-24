@@ -157,36 +157,29 @@ def plot_loss(
     raw_losses = [loss for _, loss in records]
     smoothed_losses = moving_average(raw_losses, smooth_window)
 
-    figure = Figure(figsize=(12, 8), constrained_layout=True)
+    figure = Figure(figsize=(12, 6.5), constrained_layout=True)
     FigureCanvasAgg(figure)
-    raw_axis, smooth_axis = figure.subplots(2, 1, sharex=True)
+    axis = figure.subplots()
 
-    raw_axis.plot(
+    axis.plot(
         steps,
         raw_losses,
         color="#4C78A8",
-        linewidth=1.2,
-        marker="o",
-        markersize=2.5,
+        linewidth=1.0,
+        alpha=0.25,
         label="Raw loss",
     )
-    raw_axis.set_title("Raw Loss")
-    raw_axis.set_ylabel("Loss")
-    raw_axis.grid(alpha=0.25)
-    raw_axis.legend()
-
-    smooth_axis.plot(
+    axis.plot(
         steps,
         smoothed_losses,
         color="#F58518",
-        linewidth=2.0,
+        linewidth=2.4,
         label=f"Centered moving average (window={smooth_window})",
     )
-    smooth_axis.set_title("Smoothed Loss")
-    smooth_axis.set_xlabel("Optimizer Step")
-    smooth_axis.set_ylabel("Loss")
-    smooth_axis.grid(alpha=0.25)
-    smooth_axis.legend()
+    axis.set_xlabel("Optimizer Step")
+    axis.set_ylabel("Loss")
+    axis.grid(alpha=0.25)
+    axis.legend()
 
     figure.suptitle(title)
     output.parent.mkdir(parents=True, exist_ok=True)
