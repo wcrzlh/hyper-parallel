@@ -1,0 +1,188 @@
+# Qwen3.6-35B-A3B-kvfirst-mla-gkd-thinking 长序列训练配方
+#
+# 模型: 40层 (10 full_attention + 30 linear_attention)
+#   - full_attention: Qwen3_5MoeAttention with MLA KV compression
+#     → 最终调用 F.scaled_dot_product_attention
+#     → CP: sdpa_hf_ulysses (拦截 F.sdpa, Ulysses seq/head 交换)
+#   - linear_attention: Qwen3_5MoeGatedDeltaNet (GDN)
+#     → 调用 self.causal_conv1d_fn + self.chunk_gated_delta_rule
+#     → CP: gdn_ulysses (拦截 GDN primitives, Ulysses 交换)
+#
+# 数据: sft_hybrid_long_16k_plus.jsonl (14963 条, 16K-44K tokens)
+# 格式: conversation (messages), 使用 tokenizer 原生 chat template
+#
+# 拓扑: 16 chips, CP=2, FSDP=8, EP=1 (MoE 参数走 FSDP)
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /data1/w00842045/models/Qwen/Qwen3.6-35B-A3B-kvfirst-mla-gkd-thinking
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+  trust_remote_code: true
+
+training:
+  train_iters: 1000
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  # Canonical mixed-precision recipe for optimizer stability: bf16 compute
+  # params/gradients with an fp32 master copy and fp32 optimizer states. This
+  # doubles optimizer-state memory versus bf16-only updates, so a 35B model on
+  # 8x61GB cards must add nodes (or use fewer layers for a single-node test).
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  # Full attention (MLA) CP: 拦截 F.sdpa, Ulysses seq→head 交换
+  - match: "*.self_attn"
+    when: cp
+    inner_target: self
+    inner_wrapper: sdpa_hf_ulysses
+    region_dispatch: false
+  # GDN linear attention CP: 拦截 causal_conv1d_fn + chunk_gated_delta_rule
+  - match: "*.linear_attn"
+    when: cp
+    inner_target: self
+    inner_wrapper: gdn_ulysses
+    region_dispatch: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+loss_fn:
+  _target_: hyper_parallel.components.losses.chunked_cross_entropy.ChunkedCausalLMLoss
+  chunk_size: 2048
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: tokenizer
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /data1/w00842045/models/Qwen/Qwen3.6-35B-A3B-kvfirst-mla-gkd-thinking
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: true
+
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: conversation
+    text_keys: messages
+    max_seq_len: 32768
+
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: /data1/w00842045/data/sft_hybrid_long_16k_plus.jsonl
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: null
+    create_attention_mask_in_dataloader: true
+    labels_are_shifted: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  min_buffered_samples: 16
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+    cp_algorithm: ulysses
+  dataloader_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  # fp32 master params + fp32 Adam moments; required when model parameters are
+  # initialized in bf16 (enforced by the optimizer dtype validation).
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 10
+    min_lr: 1.0e-6
+
+checkpoint:
+  save_ckpt: true
+  save_hf_weights: true
+  checkpoint_dir: /data3/w00842045/output/qwen35mla-cp-train/checkpoints
+  save_steps: 200
+  save_epochs: 1
+  is_async: false
+  save_optimizer: false
+  save_train_state: false
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 4
+  trace_dir: /data3/w00842045/output/qwen35mla-cp-train/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0
