@@ -306,13 +306,25 @@ class _BaseHyperAutoModelClass:
         Used by the HF-native path in _init_model so that the model is loaded
         through the standard transformers checkpoint logic.
         """
-        # Mixin: `super()` resolves to the HF AutoModel base at runtime (see
-        # HyperAutoModelForCausalLM etc. below), which provides from_pretrained.
+        # We must call the HF Auto class's ``from_pretrained`` *directly* (not
+        # via ``super()``) so that ``cls`` inside
+        # ``_BaseAutoModelClass.from_pretrained`` is the HF class (e.g.
+        # ``AutoModelForCausalLM``), matching the keys in ``config.auto_map``.
+        # Using ``super()`` would leave ``cls`` as the Hyper-Parallel subclass
+        # (e.g. ``HyperAutoModelForCausalLM``) whose ``__name__`` is absent
+        # from ``auto_map``, silently falling back to the built-in model and
+        # bypassing ``trust_remote_code``.
+        for base in cls.__mro__[1:]:
+            if base.__name__.startswith("Auto") and hasattr(base, "from_pretrained"):
+                return base.from_pretrained(*args, **kwargs)
         return super().from_pretrained(*args, **kwargs)  # pylint: disable=E1101
 
     @classmethod
     def _from_config_parent_class(cls, *args, **kwargs):
         """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
+        for base in cls.__mro__[1:]:
+            if base.__name__.startswith("Auto") and hasattr(base, "from_config"):
+                return base.from_config(*args, **kwargs)
         return super().from_config(*args, **kwargs)  # pylint: disable=no-member
 
     @classmethod

@@ -208,14 +208,28 @@ def _init_model(
                 **config_kwargs,
             )
         else:
-            model = getattr(cls, "_from_pretrained_parent_class")(
-                pretrained_model_name_or_path,
-                *model_args,
-                config=hf_config,
-                torch_dtype=torch_dtype,
-                attn_implementation=attn_implementation,
-                **kwargs,
-            )
+            trust_rc = bool(kwargs.get("trust_remote_code", False))
+            has_auto_map = getattr(hf_config, "auto_map", None) is not None
+            if trust_rc and has_auto_map:
+                # Let transformers resolve the remote-code model class through
+                # auto_map. Passing an explicit config object would bypass that
+                # resolution and fall back to the built-in implementation.
+                model = getattr(cls, "_from_pretrained_parent_class")(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
+            else:
+                model = getattr(cls, "_from_pretrained_parent_class")(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    config=hf_config,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
         return False, model
 
     # ── Path B: Custom model implementation ──
@@ -235,14 +249,25 @@ def _init_model(
                 hf_config, **config_kwargs
             )
         else:
-            model = getattr(cls, "_from_pretrained_parent_class")(
-                pretrained_model_name_or_path,
-                *model_args,
-                config=hf_config,
-                torch_dtype=torch_dtype,
-                attn_implementation=attn_implementation,
-                **kwargs,
-            )
+            trust_rc = bool(kwargs.get("trust_remote_code", False))
+            has_auto_map = getattr(hf_config, "auto_map", None) is not None
+            if trust_rc and has_auto_map:
+                model = getattr(cls, "_from_pretrained_parent_class")(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
+            else:
+                model = getattr(cls, "_from_pretrained_parent_class")(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    config=hf_config,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
         return False, model
 
     # Instantiate custom model
