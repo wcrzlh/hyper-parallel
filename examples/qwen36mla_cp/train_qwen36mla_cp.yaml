@@ -161,7 +161,7 @@ lr_scheduler:
 checkpoint:
   save_ckpt: true
   save_hf_weights: true
-  checkpoint_dir: /data3/w00842045/output/qwen35mla-cp-train/checkpoints
+  checkpoint_dir: /data3/w00842045/output/qwen36mla-cp-train/checkpoints
   save_steps: 200
   save_epochs: 1
   is_async: false
@@ -180,7 +180,7 @@ profiling:
   enabled: false
   start_step: 3
   end_step: 4
-  trace_dir: /data3/w00842045/output/qwen35mla-cp-train/profiling
+  trace_dir: /data3/w00842045/output/qwen36mla-cp-train/profiling
   record_shapes: false
   profile_memory: false
   with_stack: false
