@@ -21,6 +21,9 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
+import torch
+import torch.distributed as dist
+
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
@@ -97,6 +100,12 @@ class _FakeCheckpointer:
 
 class TestCheckpointerCallbackRestore(unittest.TestCase):
     """Verify what each restore mode reads back into the trainer."""
+
+    def setUp(self) -> None:
+        # Other UT modules may leave a real (stale) process group behind; the
+        # rank-consistent time-cadence path would then hit a dead collective.
+        if torch.distributed.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
     @staticmethod
     def _build_trainer(restore_from: str, restore_train_state: bool) -> SimpleNamespace:
