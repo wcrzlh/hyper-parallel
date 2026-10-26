@@ -36,6 +36,7 @@ from torch.nn import functional
 from transformers.utils import ModelOutput
 
 from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.components.losses.mtp_objective import mtp_objectives, validate_mtp_loss_weight
 
 
 def _linear_cross_entropy_chunk(
@@ -227,6 +228,8 @@ class ChunkedCausalLMOutput(ModelOutput):
 
     loss_sum: torch.Tensor | None = None
     valid_token_count: torch.Tensor | None = None
+    mtp_loss_sum: torch.Tensor | None = None
+    mtp_valid_token_count: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
     aux_loss_coef: float | None = None
     logits: torch.Tensor | None = None
@@ -246,13 +249,15 @@ class ChunkedCausalLMLoss(nn.Module):
     ``mean_global_loss``.
     """
 
-    def __init__(self, chunk_size: int = 1024, ignore_index: int = -100) -> None:
+    def __init__(self, chunk_size: int = 1024, ignore_index: int = -100, mtp_loss_weight: float = 0.3) -> None:
         """Initialize and validate the per-rank sequence chunk options."""
         super().__init__()
         _validate_chunk_options(chunk_size, ignore_index)
         self.chunk_size = chunk_size
         self.ignore_index = ignore_index
         self._model_is_bound = False
+        self.mtp_loss_weight = validate_mtp_loss_weight(mtp_loss_weight)
+        self.mtp_enabled = False
 
     @staticmethod
     def _parallel_size(distributed_setup: Any, name: str) -> int:
@@ -303,6 +308,12 @@ class ChunkedCausalLMLoss(nn.Module):
                 "remove lm_head from fsdp_config.root_wrap_modules or disable chunk loss"
             )
 
+        self.mtp_enabled = bool(getattr(model, "_hp_mtp_enabled", False))
+        validate_mtp_loss_weight(self.mtp_loss_weight, enabled=self.mtp_enabled)
+        if self.mtp_enabled:
+            self._model_is_bound = True
+            return
+
         # Lazy imports keep generic loss-package import independent of concrete
         # model families and their optional backend dependencies.
         from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=import-outside-toplevel
@@ -332,6 +343,8 @@ class ChunkedCausalLMLoss(nn.Module):
         """Move labels to the model-family no-full-logits protocol."""
         if not self._model_is_bound:
             raise RuntimeError("ChunkedCausalLMLoss must be bound before model forward")
+        if self.mtp_enabled and "mtp_targets" not in model_inputs:
+            raise ValueError("MTP requires globally shifted targets from a compatible batch adapter")
         targets = loss_inputs.get("shift_labels")
         if not isinstance(targets, torch.Tensor):
             raise ValueError(
@@ -367,6 +380,8 @@ class ChunkedCausalLMLoss(nn.Module):
         labels: torch.Tensor | None,
     ) -> torch.Tensor:
         """Normalize one adapter-produced CE sum exactly once."""
+        if self.mtp_enabled:
+            return mtp_objectives(model_output, self.mtp_loss_weight)
         logits = _get_output_value(model_output, "logits")
         if logits is not None:
             raise ValueError(

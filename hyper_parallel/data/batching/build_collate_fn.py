@@ -114,6 +114,7 @@ class TextPackingCollator(DataCollator):
         cu_seq_lens = torch.cat((zero, seq_ends))
         cu_seq_lens = cu_seq_lens.to(torch.int32)
         packed_batch["cu_seq_lens"] = cu_seq_lens
+        packed_batch["num_sequences"] = len(model_samples)
 
         return packed_batch
 

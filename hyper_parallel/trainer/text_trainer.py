@@ -150,6 +150,10 @@ class TextTrainer:
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
         self.base.get_batch = get_batch
+        if getattr(self.base.model, "_hp_mtp_enabled", False):
+            if not callable(getattr(get_batch, "bind_model", None)):
+                raise ValueError("MTP requires a batch adapter with bind_model support")
+            get_batch.bind_model(self.base.model)
 
     @property
     def distributed_setup(self) -> Any:

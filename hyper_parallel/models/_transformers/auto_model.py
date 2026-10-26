@@ -96,6 +96,7 @@ class _BaseHyperAutoModelClass:
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "sdpa",
         force_hf: bool = False,
+        enable_mtp: bool = False,
         validate_placement: bool = False,
         qat_config: Optional[Any] = None,
         fp8_config: Optional[Any] = None,
@@ -118,6 +119,10 @@ class _BaseHyperAutoModelClass:
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
+        if enable_mtp:
+            # Optional Qwen adapter owns MTP-specific parallel declarations.
+            from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import mtp_distributed_setup  # pylint: disable=C0415
+            distributed_setup = mtp_distributed_setup(distributed_setup)
         mesh = distributed_setup.mesh_context
 
         # ② Instantiate infrastructure
@@ -149,6 +154,7 @@ class _BaseHyperAutoModelClass:
             attn_implementation=attn_implementation,
             validate_placement=validate_placement,
             load_base_model=True,
+            enable_mtp=enable_mtp,
             distributed_setup=distributed_setup,
             qat_config=qat_config,
             fp8_config=fp8_config,
@@ -166,6 +172,7 @@ class _BaseHyperAutoModelClass:
         cls,
         config: PretrainedConfig,
         *model_args: Any,
+        enable_mtp: bool = False,
         distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional[Any] = None,
         backend: Optional[Any] = None,
@@ -189,6 +196,10 @@ class _BaseHyperAutoModelClass:
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
+        if enable_mtp:
+            # Optional Qwen adapter owns MTP-specific parallel declarations.
+            from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import mtp_distributed_setup  # pylint: disable=C0415
+            distributed_setup = mtp_distributed_setup(distributed_setup)
         mesh = distributed_setup.mesh_context
 
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
@@ -212,6 +223,7 @@ class _BaseHyperAutoModelClass:
             attn_implementation=attn_implementation,
             validate_placement=validate_placement,
             load_base_model=False,
+            enable_mtp=enable_mtp,
             distributed_setup=distributed_setup,
             qat_config=qat_config,
             fp8_config=fp8_config,
@@ -240,6 +252,7 @@ class _BaseHyperAutoModelClass:
         attn_implementation,
         validate_placement,
         load_base_model,
+        enable_mtp=False,
         distributed_setup=None,
         qat_config=None,
         fp8_config=None,
@@ -273,9 +286,16 @@ class _BaseHyperAutoModelClass:
 
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
+        if not isinstance(enable_mtp, bool):
+            raise ValueError("enable_mtp must be a boolean")
+        compile_enabled = (compile_config.get("enabled", False) if isinstance(compile_config, dict)
+                           else getattr(compile_config, "enabled", False))
+        if enable_mtp and (peft_config or qat_config or fp8_config or compile_enabled or activation_swap != "none"
+                           or swap_inputs or kwargs.get("quantization_config")):
+            raise NotImplementedError("MTP does not support PEFT, quantization, compile or activation swap")
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         is_meta_device = (
-            world_size > 1 or not is_hf_model
+            world_size > 1 or not is_hf_model or (enable_mtp and load_base_model)
         ) and kwargs.get("quantization_config") is None
 
         init_ctx = (
@@ -288,7 +308,7 @@ class _BaseHyperAutoModelClass:
         with init_ctx:
             _, model = _init_model(
                 cls,
-                pretrained_model_name_or_path,
+                None if enable_mtp else pretrained_model_name_or_path,
                 hf_config,
                 attn_implementation,
                 torch_dtype,
@@ -297,6 +317,10 @@ class _BaseHyperAutoModelClass:
                 backend=backend,
                 **kwargs,
             )
+            if enable_mtp:
+                # Optional Qwen family dependency; attach before checkpoint mapping and FSDP.
+                from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import attach_mtp  # pylint: disable=C0415
+                attach_mtp(model, mesh)
 
         # Step 3-12: Apply infrastructure
         model = apply_model_infrastructure(

@@ -28,6 +28,7 @@ from hyper_parallel.data.omni.get_batch import OmniParallelBatch
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature, EncoderWorkItem
 from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import _chunk_loss_forward
+from hyper_parallel.components.losses.mtp_objective import build_mtp_targets
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,11 @@ def install_qwen_vlm_cp_forward(model: Any) -> None:
             kwargs.pop(field, None)
         forward_impl = original_forward
         chunked = "chunk_loss_targets" in kwargs
-        if chunked:
+        if "mtp_targets" in kwargs:
+            # Optional model family training runtime; avoid importing it for ordinary VLM.
+            from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import mtp_forward  # pylint: disable=C0415
+            forward_impl = partial(mtp_forward, model)
+        elif chunked:
             # Use the VLM loss adapter directly so either binding order is safe.
             forward_impl = partial(_chunk_loss_forward, model)
         output = forward_impl(
@@ -174,7 +179,7 @@ class QwenVLMParallelBatch(OmniParallelBatch):
         if model.config.model_type != "qwen3_5_moe":
             raise ValueError("QwenVLMParallelBatch requires the conditional-generation Qwen MoE model")
         self.model, self.bridge = model, QwenVisionBridge(model)
-        if self.parallel_context.cp_world_size > 1:
+        if self.parallel_context.cp_world_size > 1 or getattr(model, "_hp_mtp_enabled", False):
             install_qwen_vlm_cp_forward(model)
 
     def _pad(self, source: Mapping[str, Any]) -> dict[str, Any]:
@@ -205,7 +210,8 @@ class QwenVLMParallelBatch(OmniParallelBatch):
         batch = self.tp_broadcaster.broadcast(self._pad(self._normalize_source_batch(source)))
         images = self.bridge.parse_images(batch)
         cp_size = self.parallel_context.cp_world_size
-        if cp_size == 1:
+        mtp_enabled = getattr(self.model, "_hp_mtp_enabled", False)
+        if cp_size == 1 and not mtp_enabled:
             model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
             if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
                 targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:].contiguous()
@@ -220,6 +226,10 @@ class QwenVLMParallelBatch(OmniParallelBatch):
         length = global_ids.shape[1] // cp_size
         start = self.parallel_context.cp_rank * length
         stop = start + length
+        if mtp_enabled:
+            full_targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:].contiguous()
+            mtp_targets = build_mtp_targets(full_targets, self.model.mtp.depth)[..., start:stop].contiguous()
+            mtp_mask = batch["attention_mask"]
         targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:][:, start:stop].contiguous()
         geometry = QwenVLMCPInputs(start, stop, positions[..., start:stop].contiguous(), targets, images)
         for field, value in tuple(batch.items()):
@@ -236,12 +246,16 @@ class QwenVLMParallelBatch(OmniParallelBatch):
         model_inputs.update(runtime_inputs)
         model_inputs["vlm_cp_inputs"] = geometry
         self._add_chunk_targets(model_inputs, loss_inputs, targets)
+        if mtp_enabled:
+            model_inputs["mtp_targets"] = mtp_targets
+            model_inputs["mtp_attention_mask"] = mtp_mask
+            loss_inputs["mtp_labels"] = mtp_targets
         return model_inputs, loss_inputs
 
     def _add_chunk_targets(self, model_inputs: dict[str, Any], loss_inputs: dict[str, Any],
                            targets: torch.Tensor) -> None:
         """Expose aligned labels only to the opt-in chunk objective and token counter."""
-        if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
+        if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False) or getattr(self.model, "_hp_mtp_enabled", False):
             for inputs in (model_inputs, loss_inputs):
                 inputs["shift_labels"] = targets
                 inputs["loss_mask"] = targets.ne(-100)

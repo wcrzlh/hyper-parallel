@@ -21,6 +21,8 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.components.losses.mtp_objective import build_mtp_targets
+
 from hyper_parallel.data.batching.attention_runtime import (
     AttentionRuntimeAdapter,
     build_dense_attention_masks,
@@ -127,6 +129,13 @@ class ParallelBatch:
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
         self.attention_runtime_adapter = attention_runtime_adapter
+        self.mtp_depth = 0
+
+    def bind_model(self, model: Any) -> None:
+        """Enable global future-target preparation only for an explicit MTP model."""
+        self.mtp_depth = model.mtp.depth if getattr(model, "_hp_mtp_enabled", False) else 0
+        if self.mtp_depth and (self.parallel_context.tp_world_size != 1 or not self.labels_are_shifted):
+            raise NotImplementedError("Text MTP requires TP=1 and already shifted dataset labels")
 
     def __call__(
             self,
@@ -166,6 +175,23 @@ class ParallelBatch:
         parallel_batch["packed_seq_params"] = packed_seq_params
 
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(parallel_batch)
+
+        if self.mtp_depth:
+            num_sequences = canonical_batch.get("num_sequences", cu_seq_lens.numel() - 1)
+            if canonical_batch["input_ids"].shape[0] != 1 or num_sequences != 1:
+                raise NotImplementedError("MTP requires one unpacked conversation per micro batch")
+            targets = canonical_batch["labels"].to(parallel_batch["labels"].device)
+            global_mask = self._build_loss_mask({
+                "labels": targets, "input_ids": canonical_batch["input_ids"].to(targets.device),
+            })
+            targets = targets.masked_fill(~global_mask.bool(), -100)
+            future = build_mtp_targets(targets, self.mtp_depth)
+            length = parallel_batch["input_ids"].shape[1]
+            start = self.parallel_context.cp_rank * length
+            local_targets = future[..., start:start + length].contiguous()
+            model_inputs["mtp_targets"] = local_targets
+            model_inputs["mtp_attention_mask"] = attention_mask
+            loss_inputs["mtp_labels"] = local_targets
 
         return model_inputs, loss_inputs
 
