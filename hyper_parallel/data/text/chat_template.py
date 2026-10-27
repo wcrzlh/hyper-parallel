@@ -22,6 +22,7 @@ Canonical merge (05 §11.3) of the former
 """
 
 import os
+from copy import copy
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -40,6 +41,7 @@ from typing import (
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.data.thinking import thinking_kwargs, validate_thinking_mode
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
@@ -471,6 +473,8 @@ class TokenizerTemplate(ChatTemplate):
             messages: Sequence[Mapping[str, Any]],
             max_seq_len: int = 8192,
             tools: Optional[Sequence[Mapping[str, Any]]] = None,
+            thinking_mode: str = "legacy",
+            enable_thinking: Optional[bool] = None,
     ) -> Dict[str, List[int]]:
         """Encode messages with the tokenizer chat template and mask non-assistant loss.
 
@@ -486,6 +490,8 @@ class TokenizerTemplate(ChatTemplate):
             messages: Conversation records with ``role``, ``content``, and optional ``loss_mask``.
             max_seq_len: Maximum sequence length kept from the end of the encoding.
             tools: Optional tool definitions forwarded to the native tokenizer template.
+            thinking_mode: ``legacy`` preserves template defaults; ``auto`` detects reasoning per assistant.
+            enable_thinking: Optional sample-level override for every assistant turn.
 
         Returns:
             Model inputs with input_ids, attention_mask, and labels.
@@ -494,7 +500,18 @@ class TokenizerTemplate(ChatTemplate):
             ValueError: If the template rewrites or shortens an earlier conversation prefix, or if leading
                 system messages cannot be grouped without changing the configured loss mask.
         """
-        self._log_first_template(messages, tools)
+        validate_thinking_mode(thinking_mode)
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ValueError("sample enable_thinking must be a bool or None")
+        log_renderer = self
+        if thinking_mode != "legacy" or enable_thinking is not None:
+            log_renderer = copy(self)
+            last_assistant = next((item for item in reversed(messages) if item["role"] == "assistant"), {})
+            log_renderer.chat_template_kwargs = thinking_kwargs(
+                last_assistant, thinking_mode, enable_thinking, self.chat_template_kwargs,
+            )
+        log_renderer._log_first_template(messages, tools)
+        self._has_logged_first_rendered_template = log_renderer._has_logged_first_rendered_template
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
@@ -503,6 +520,15 @@ class TokenizerTemplate(ChatTemplate):
         has_pending_system_messages = False
         for end, message in enumerate(messages, start=1):
             loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
+            renderer = self
+            if thinking_mode != "legacy" or enable_thinking is not None:
+                renderer = copy(self)
+                renderer.chat_template_kwargs = dict(self.chat_template_kwargs)
+                renderer.chat_template_kwargs.setdefault("preserve_thinking", True)
+                if message["role"] == "assistant":
+                    renderer.chat_template_kwargs = thinking_kwargs(
+                        message, thinking_mode, enable_thinking, renderer.chat_template_kwargs,
+                    )
             if previous_length == 0 and message["role"] == "system":
                 if loss_mask == 1:
                     raise ValueError(
@@ -518,12 +544,12 @@ class TokenizerTemplate(ChatTemplate):
 
             supervise_assistant = message["role"] == "assistant" and loss_mask == 1
             if supervise_assistant:
-                source_ids, target_ids, rendered_text = self._encode_assistant_source_target(
+                source_ids, target_ids, rendered_text = renderer._encode_assistant_source_target(
                     messages[:end], previous_text, input_ids, tools,
                 )
                 rendered_conversation_ids = source_ids + target_ids
             else:
-                rendered_text = self._apply_chat_template(
+                rendered_text = renderer._apply_chat_template(
                     messages[:end],
                     tokenize=False,
                     return_dict=False,

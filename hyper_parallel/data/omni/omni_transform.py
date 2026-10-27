@@ -26,6 +26,7 @@ from typing import Any
 from transformers import AutoProcessor
 
 from hyper_parallel.data.omni.constants import IGNORE_INDEX, OMNI_CP_TOKEN_FIELDS, ONLINE_SOURCE_PATH_KEY
+from hyper_parallel.data.thinking import thinking_kwargs, validate_thinking_mode
 
 
 def build_auto_processor(
@@ -254,9 +255,25 @@ class OmniDataTransform:
 
 
 class AutoProcessorTransform(OmniDataTransform):
-    """Encode a conversation and supervise only its final assistant response."""
+    """Preserve processor inputs and supervise every selected assistant turn."""
 
-    def _assistant_prompt_length(self, messages: list, input_ids: Any, prompt_ids: Any) -> int:
+    def __init__(self, *, max_seq_len: int, processor: Any, thinking_mode: str = "legacy",
+                 chat_template_kwargs: Mapping[str, Any] | None = None) -> None:
+        """Configure optional automatic thinking detection and native template options."""
+        super().__init__(max_seq_len=max_seq_len, processor=processor)
+        validate_thinking_mode(thinking_mode)
+        self.thinking_mode = thinking_mode
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        reserved = {"messages", "tokenize", "return_dict", "return_tensors", "add_generation_prompt"}
+        if reserved.intersection(self.chat_template_kwargs):
+            raise ValueError("chat_template_kwargs overrides processor-owned arguments")
+        for key in ("enable_thinking", "preserve_thinking"):
+            value = self.chat_template_kwargs.get(key)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"chat_template_kwargs.{key} must be a bool")
+
+    def _assistant_prompt_length(self, messages: list, input_ids: Any, prompt_ids: Any,
+                                 template_kwargs: Mapping[str, Any] | None = None) -> int:
         """Locate the prompt in processor output without retokenizing media spans.
 
         A token crossing the source/target character boundary is masked in full.
@@ -267,10 +284,10 @@ class AutoProcessorTransform(OmniDataTransform):
             return len(prompt_ids)
 
         full_text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
+            messages, tokenize=False, add_generation_prompt=False, **(template_kwargs or {}),
         )
         prompt_text = self.processor.apply_chat_template(
-            messages[:-1], tokenize=False, add_generation_prompt=True,
+            messages[:-1], tokenize=False, add_generation_prompt=True, **(template_kwargs or {}),
         )
         if not full_text.startswith(prompt_text):
             raise ValueError("Assistant generation prompt must be a text prefix of the full conversation")
@@ -284,7 +301,8 @@ class AutoProcessorTransform(OmniDataTransform):
             common_length += 1
         return self._merged_prompt_length(full_tokens, prompt_tokens, common_length)
 
-    def _merged_prompt_length(self, full_tokens: list[int], prompt_tokens: list[int], common_length: int) -> int:
+    def _merged_prompt_length(self, full_tokens: list[int], prompt_tokens: list[int], common_length: int,
+                              round_up: bool = True) -> int:
         """Accept only text-equivalent retokenization after the shared token prefix."""
         decode_kwargs = {"skip_special_tokens": False, "clean_up_tokenization_spaces": False}
         tokenizer = self.processor.tokenizer
@@ -297,8 +315,57 @@ class AutoProcessorTransform(OmniDataTransform):
         for end in range(common_length + 1, len(full_tokens) + 1):
             decoded = tokenizer.decode(full_tokens[common_length:end], **decode_kwargs)
             if full_tail.startswith(decoded) and decoded.startswith(prompt_tail):
-                return end
+                return end if round_up or decoded == prompt_tail else end - 1
         raise ValueError("Cannot locate assistant supervision boundary in processor tokens")
+
+    def _prefix_boundary(self, full_ids: Any, prefix_ids: Any, *, round_up: bool) -> int:
+        """Map an already checked text prefix onto the unchanged full token sequence."""
+        common = 0
+        full_tokens, prefix_tokens = full_ids.tolist(), prefix_ids.tolist()
+        for left, right in zip(full_tokens, prefix_tokens):
+            if left != right:
+                break
+            common += 1
+        if common == len(prefix_tokens):
+            return common
+        return self._merged_prompt_length(full_tokens, prefix_tokens, common, round_up)
+
+    def _all_turn_labels(self, messages: list, input_ids: Any, options: list[dict[str, Any]]) -> Any:
+        """Locate all answer spans without concatenating independently encoded media."""
+        labels = input_ids.clone().fill_(IGNORE_INDEX)
+        full_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, **options[-1],
+        )
+        previous_end = 0
+        for index, message in enumerate(messages):
+            if message.get("role") != "assistant":
+                continue
+            kwargs = options[index]
+            history = messages[:index + 1]
+            end_text = self.processor.apply_chat_template(
+                history, tokenize=False, add_generation_prompt=False, **kwargs,
+            )
+            prompt_text = self.processor.apply_chat_template(
+                history[:-1], tokenize=False, add_generation_prompt=True, **kwargs,
+            )
+            if not full_text.startswith(end_text) or not end_text.startswith(prompt_text):
+                raise ValueError("Assistant history was rewritten; use a prefix-stable template with preserve_thinking")
+            prompt = self.processor.apply_chat_template(
+                history[:-1], tokenize=True, return_dict=True, return_tensors="pt",
+                add_generation_prompt=True, **kwargs,
+            )["input_ids"].squeeze(0)
+            complete = input_ids if index == len(messages) - 1 else self.processor.apply_chat_template(
+                history, tokenize=True, return_dict=True, return_tensors="pt",
+                add_generation_prompt=False, **kwargs,
+            )["input_ids"].squeeze(0)
+            start = self._prefix_boundary(input_ids, prompt, round_up=True)
+            stop = self._prefix_boundary(input_ids, complete, round_up=False)
+            if not previous_end <= start <= stop <= len(input_ids):
+                raise ValueError("Assistant supervision spans overlap or have invalid token boundaries")
+            if message.get("loss_mask", 1) == 1:
+                labels[start:stop] = input_ids[start:stop]
+            previous_end = stop
+        return labels
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Build model inputs and assistant-only labels from processor messages.
@@ -310,29 +377,37 @@ class AutoProcessorTransform(OmniDataTransform):
         if len(messages) < 2 or messages[-1].get("role") != "assistant":
             raise ValueError("Omni training sample must end with a final assistant message")
 
+        multi_turn = sum(message.get("role") == "assistant" for message in messages) > 1
+        defaults = dict(self.chat_template_kwargs)
+        if multi_turn:
+            defaults.setdefault("preserve_thinking", True)
+        options = [thinking_kwargs(message, self.thinking_mode, sample.get("enable_thinking"), defaults)
+                   if message.get("role") == "assistant" else defaults for message in messages]
+        template_kwargs = options[-1]
+
         encoded_sample = dict(self.processor.apply_chat_template(
             messages,
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
             add_generation_prompt=False,
+            **template_kwargs,
         ))
-        prompt_sample = self.processor.apply_chat_template(
-            messages[:-1],
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            add_generation_prompt=True,
-        )
-
         input_ids = encoded_sample["input_ids"].squeeze(0)
-        prompt_ids = prompt_sample["input_ids"].squeeze(0)
         if len(input_ids) > self.max_seq_len:
             raise ValueError("Omni sample exceeds max_seq_len; refusing to truncate a possible media span")
-        prompt_length = self._assistant_prompt_length(messages, input_ids, prompt_ids)
-
-        labels = input_ids.clone()
-        labels[:prompt_length] = IGNORE_INDEX
+        if multi_turn:
+            labels = self._all_turn_labels(messages, input_ids, options)
+        else:
+            prompt_ids = self.processor.apply_chat_template(
+                messages[:-1], tokenize=True, return_dict=True, return_tensors="pt",
+                add_generation_prompt=True, **template_kwargs,
+            )["input_ids"].squeeze(0)
+            prompt_length = self._assistant_prompt_length(messages, input_ids, prompt_ids, template_kwargs)
+            labels = input_ids.clone()
+            labels[:prompt_length] = IGNORE_INDEX
+            if messages[-1].get("loss_mask", 1) != 1:
+                labels.fill_(IGNORE_INDEX)
         if "mm_token_type_ids" in encoded_sample:
             labels[encoded_sample["mm_token_type_ids"].squeeze(0) != 0] = IGNORE_INDEX
         if not labels[1:].ne(IGNORE_INDEX).any():

@@ -98,7 +98,6 @@ dataset:
   model_assets:
     chat_template: tokenizer
     chat_template_kwargs:
-      enable_thinking: true
       reasoning_effort: medium
       # Keep historical reasoning so incremental loss-mask boundaries remain stable.
       preserve_thinking: true
@@ -112,6 +111,7 @@ dataset:
   data_transform:
     _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
     data_type: conversation
+    thinking_mode: auto
     text_keys: messages
     max_seq_len: 4096
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset

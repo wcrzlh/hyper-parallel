@@ -92,6 +92,9 @@ dataset:
   data_config: {}
   data_transform:
     _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform
+    thinking_mode: auto
+    chat_template_kwargs:
+      preserve_thinking: true
     max_seq_len: 8192
 
 dataloader:

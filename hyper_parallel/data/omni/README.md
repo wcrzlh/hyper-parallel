@@ -14,7 +14,7 @@ targets must migrate to the example below; there are no compatibility aliases.
 | Component | Responsibility |
 | --- | --- |
 | `OmniDataTransform` | Eager encoding, deferred encoding after selection, and batch encoding hooks |
-| `AutoProcessorTransform` | Processor-backed conversation encoding and final-assistant supervision |
+| `AutoProcessorTransform` | Processor-backed conversation encoding and all-assistant supervision |
 | `OmniMappingDataset` | Local JSON/JSONL/Parquet indexing, relative media paths, and lifecycle delegation |
 | `OmniPackingLoader` | Candidate selection, packing, and checkpointing of unread buffered samples |
 | `SamplePacker` | Concatenate fields, offset media token starts, and produce `cu_seq_lens` |
@@ -47,12 +47,33 @@ worker's cache can hold a full row group's compressed image bytes.
 explicit `{train: ..., valid: ..., test: ...}` mapping. Each default-transform
 record contains `messages`; its final message must be an assistant response.
 Relative image/video/audio paths are resolved against the source file directory.
-The default transform supervises **only the final assistant response**, following
-the extracted PR. This does not change our text path's multi-turn supervision.
-Processor templates must preserve the token prefix produced by
-`add_generation_prompt=True`; incompatible templates are rejected, not silently
-masked. Existing text-specific tools/reasoning fixes are not automatically used
-by this separate processor path.
+The default transform supervises **every assistant response**, without a separate
+loss-mode switch. A message with `loss_mask: 0` is excluded. User/system/tool and
+media tokens are masked. Labels remain unshifted here; the training loss path
+performs the next-token shift. Full processor inputs and media ordering are preserved.
+Templates must preserve earlier rendered history. Lossless boundary token merges
+are accepted, but tokens crossing a supervision boundary are conservatively masked;
+history rewriting is rejected instead of silently producing incorrect labels.
+
+### Mixed fast and slow thinking
+
+Set `thinking_mode: auto` on `AutoProcessorTransform` (or on the pure-text
+`build_llm_data_transform` with a native tokenizer chat template). Each assistant
+turn is classified independently: nonempty `reasoning_content`, or a leading
+`<think>...</think>` block, selects thinking; otherwise it selects fast answering.
+Structured `reasoning_content` takes precedence over inline detection. A sample's
+optional boolean `enable_thinking` overrides detection for all its assistant turns.
+`false` combined with nonempty reasoning is rejected rather than dropping reasoning.
+
+The native template defines the actual prompt: for Qwen, fast mode masks the
+complete empty think block; slow mode masks the opening think prefix and supervises
+the reasoning and answer. Auto mode retains historical thinking by default.
+Do not explicitly disable `preserve_thinking` when the template would rewrite
+previously supervised history. Unsupported/non-prefix-stable templates fail validation.
+
+`thinking_mode: legacy` is the default and preserves existing thinking options.
+Single-turn VLM and the pure-text default path retain their existing behavior;
+multi-turn VLM now supervises all assistant turns and retains historical reasoning.
 
 ### Embedded images in Parquet
 

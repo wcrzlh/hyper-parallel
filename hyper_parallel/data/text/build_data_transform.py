@@ -31,6 +31,7 @@ from typing import Any, Literal
 import torch
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.thinking import validate_thinking_mode
 
 LLMDataType = Literal["plaintext", "conversation", "instruction"]
 logger = get_dataset_logger(__name__)
@@ -127,11 +128,15 @@ def _encode_messages(
         messages: Sequence[Mapping[str, Any]],
         max_seq_len: int,
         tools: Sequence[Mapping[str, Any]] | None = None,
+        thinking_mode: str = "legacy",
+        enable_thinking: bool | None = None,
 ) -> dict[str, Any]:
     """Encode normalized messages into a shifted causal-language-model sample."""
     encode_kwargs = {"max_seq_len": max_seq_len}
     if tools:
         encode_kwargs["tools"] = tools
+    if thinking_mode != "legacy" or enable_thinking is not None:
+        encode_kwargs.update(thinking_mode=thinking_mode, enable_thinking=enable_thinking)
     encoded = chat_template.encode_messages(messages, **encode_kwargs)
     input_ids = torch.tensor(encoded["input_ids"], dtype=torch.int64)
     labels = torch.tensor(encoded["labels"], dtype=torch.int64)
@@ -205,9 +210,11 @@ class TextConversationTransform:
     max_seq_len: int
     text_keys: str | Sequence[str] = "conversation"
     tools_key: str | None = None
+    thinking_mode: str = "legacy"
 
     def __post_init__(self) -> None:
         """Validate the chat template and sequence length configuration."""
+        validate_thinking_mode(self.thinking_mode)
         if self.chat_template is None:
             raise ValueError("chat_template is required for conversation data")
         if self.max_seq_len <= 0:
@@ -221,7 +228,8 @@ class TextConversationTransform:
         tools = None
         if self.tools_key is not None:
             tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)
-        return [_encode_messages(self.chat_template, messages, self.max_seq_len, tools)]
+        return [_encode_messages(self.chat_template, messages, self.max_seq_len, tools,
+                                 self.thinking_mode, sample.get("enable_thinking"))]
 
 
 @dataclass
@@ -232,9 +240,11 @@ class TextInstructionTransform:
     max_seq_len: int
     column_mapping: Mapping[str, str]
     input_separator: str = "\n\n"
+    thinking_mode: str = "legacy"
 
     def __post_init__(self) -> None:
         """Validate chat assets and logical-to-source column mappings."""
+        validate_thinking_mode(self.thinking_mode)
         if self.chat_template is None:
             raise ValueError("chat_template is required for instruction data")
         if self.max_seq_len <= 0:
@@ -284,7 +294,8 @@ class TextInstructionTransform:
             {"role": "user", "content": user_content},
             {"role": "assistant", "content": output},
         ]
-        return [_encode_messages(self.chat_template, messages, self.max_seq_len)]
+        return [_encode_messages(self.chat_template, messages, self.max_seq_len,
+                                 thinking_mode=self.thinking_mode, enable_thinking=sample.get("enable_thinking"))]
 
 
 def build_llm_data_transform(
@@ -297,6 +308,7 @@ def build_llm_data_transform(
         tools_key: str | None = None,
         column_mapping: Mapping[str, str] | None = None,
         input_separator: str = "\n\n",
+        thinking_mode: str = "legacy",
 ) -> Callable[[Any], Any]:
     """Build the transform selected by the LLM data type.
 
@@ -309,6 +321,7 @@ def build_llm_data_transform(
         tools_key: Optional field containing tool definitions for conversation data.
         column_mapping: Logical instruction/input/output fields mapped to source columns.
         input_separator: Separator inserted between non-empty instruction and input fields.
+        thinking_mode: Legacy template defaults or per-assistant automatic thinking detection.
 
     Returns:
         The configured LLM sample transform.
@@ -316,12 +329,15 @@ def build_llm_data_transform(
     Raises:
         ValueError: If ``data_type`` is unsupported.
     """
+    validate_thinking_mode(thinking_mode)
     if data_type == "plaintext":
+        if thinking_mode != "legacy":
+            raise ValueError("thinking_mode is only supported for conversation or instruction data")
         if tools_key is not None:
             raise ValueError("tools_key is only supported for conversation data")
         data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys)
     elif data_type == "conversation":
-        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys, tools_key)
+        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys, tools_key, thinking_mode)
     elif data_type == "instruction":
         if tools_key is not None:
             raise ValueError("tools_key is only supported for conversation data")
@@ -332,6 +348,7 @@ def build_llm_data_transform(
             max_seq_len,
             column_mapping,
             input_separator,
+            thinking_mode,
         )
     else:
         raise ValueError(f"Unsupported LLM data type: {data_type!r}")
