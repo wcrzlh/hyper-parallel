@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Analyze Decif JSONL lengths with the Qwen3.8 training chat template.
+"""Analyze Decif JSONL lengths with the Qwen training conversation transform.
 
 Example:
-    python examples/qwen3_8/tools/analyze_decif_lengths.py \
+    python -m examples.qwen3_8.tools.analyze_decif_lengths \
         --data-path /home/chaoran/datasets/decif-30k.jsonl \
-        --tokenizer-path /home/chaoran/models/Qwen3.8-27B \
-        --max-seq-len 32768 \
+        --tokenizer-path /home/chaoran/models/Qwen3.6-35B-A3B \
+        --config examples/qwen3_6_moe/train_online.yaml \
+        --tools-key tools \
         --output-dir ./outputs/decif_length_stats
 """
 
@@ -28,11 +29,21 @@ import argparse
 import csv
 import json
 import math
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable
+
+import yaml
 
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.data.text.build_data_transform import (
+    TextConversationTransform,
+    _get_record_value,
+    _normalize_conversation,
+    _normalize_tools,
+)
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.data.text.chat_template import build_chat_template
 
@@ -40,6 +51,10 @@ from hyper_parallel.data.text.chat_template import build_chat_template
 _FULL_SEQUENCE_LIMIT = 2**31 - 1
 _CSV_FIELDS = (
     "source_index",
+    "tool_count",
+    "zero_supervision",
+    "supervision_lost_to_truncation",
+    "supervised_tokens_before_truncation",
     "message_count",
     "assistant_message_count",
     "raw_character_count",
@@ -67,7 +82,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--data-path", type=Path, required=True, help="Decif JSONL file containing messages.")
-    parser.add_argument("--tokenizer-path", type=Path, required=True, help="Local Qwen3.8 tokenizer/model directory.")
+    parser.add_argument("--tokenizer-path", type=Path, required=True, help="Local Qwen tokenizer/model directory.")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -77,13 +92,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-seq-len",
         type=int,
-        default=32768,
+        default=None,
         help="Training max_seq_len used to calculate truncation and shifted labels (default: 32768).",
     )
     parser.add_argument(
         "--reasoning-effort",
         choices=("low", "medium", "xhigh"),
-        default="medium",
+        default=None,
         help="Qwen reasoning effort forwarded to the tokenizer chat template (default: medium).",
     )
     parser.add_argument(
@@ -108,6 +123,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow tokenizer code from the model directory.",
     )
+    parser.add_argument("--config", type=Path, help="Training YAML: template and conversation-transform settings")
+    parser.add_argument("--tools-key", help="Top-level tools field; empty string disables tools")
+    parser.add_argument("--text-key", help="Conversation field (defaults to messages without --config)")
+    parser.add_argument("--thinking-mode", choices=("legacy", "auto"),
+                        help="Override the training transform thinking mode")
     return parser.parse_args()
 
 
@@ -155,26 +175,40 @@ def _iter_jsonl(data_path: Path, limit: int | None) -> Iterable[tuple[int, Mappi
                 return
 
 
-def _get_messages(record: Mapping[str, Any], line_number: int) -> list[dict[str, Any]]:
-    """Return a validated OpenAI-style Decif conversation."""
-    messages = record.get("messages")
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
-        raise ValueError(f"Record at line {line_number} must contain a messages list")
+def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve training settings, with explicit CLI options taking precedence.
 
-    normalized_messages = []
-    for message_index, message in enumerate(messages):
-        if not isinstance(message, Mapping):
-            raise ValueError(f"Message {message_index} at line {line_number} must be an object")
-        role = message.get("role")
-        content = message.get("content")
-        if not isinstance(role, str) or not role:
-            raise ValueError(f"Message {message_index} at line {line_number} has an invalid role")
-        if not isinstance(content, str):
-            raise ValueError(f"Message {message_index} at line {line_number} must contain string content")
-        normalized_messages.append(dict(message))
-    if not normalized_messages:
-        raise ValueError(f"Record at line {line_number} has no messages")
-    return normalized_messages
+    Args:
+        args: CLI namespace updated with resolved transform options.
+
+    Returns:
+        Native tokenizer template keyword arguments.
+    """
+    dataset = {}
+    if args.config is not None:
+        with args.config.open(encoding="utf-8") as source:
+            dataset = yaml.safe_load(source)["dataset"]
+    transform = dataset.get("data_transform", {})
+    if transform.get("data_type", "conversation") != "conversation":
+        raise ValueError("Length analysis requires a conversation data transform")
+    assets = dataset.get("model_assets", {})
+    if assets.get("chat_template", "tokenizer") != "tokenizer":
+        raise ValueError("Length analysis requires chat_template: tokenizer")
+    options = dict(assets.get("chat_template_kwargs") or {}) if args.config else {
+        "enable_thinking": True, "reasoning_effort": "medium",
+    }
+    if args.disable_thinking:
+        options["enable_thinking"] = False
+    if args.reasoning_effort is not None:
+        options["reasoning_effort"] = args.reasoning_effort
+    args.max_seq_len = args.max_seq_len if args.max_seq_len is not None else transform.get("max_seq_len", 32768)
+    args.text_key = args.text_key if args.text_key is not None else transform.get("text_keys", "messages")
+    args.tools_key = args.tools_key if args.tools_key is not None else transform.get(
+        "tools_key", None if args.config else "tools")
+    args.tools_key = args.tools_key or None
+    args.thinking_mode = args.thinking_mode or transform.get("thinking_mode", "legacy")
+    args.template_kwargs = options
+    return options
 
 
 def _count_field_tokens(tokenizer: Any, messages: Sequence[Mapping[str, Any]], field: str) -> int:
@@ -198,6 +232,7 @@ def analyze_record(
         record: Mapping[str, Any],
         line_number: int,
         max_seq_len: int,
+        transform: TextConversationTransform | None = None,
 ) -> dict[str, Any]:
     """Measure one Decif record before and after the training truncation boundary.
 
@@ -207,30 +242,27 @@ def analyze_record(
         record: Decoded Decif JSON object.
         line_number: One-based source line number.
         max_seq_len: Training sequence-length limit before causal shifting.
+        transform: Configured training transform; defaults to messages with tools.
 
     Returns:
         Per-record statistics suitable for CSV output.
     """
-    messages = _get_messages(record, line_number)
-    encoded = chat_template.encode_messages(messages, max_seq_len=_FULL_SEQUENCE_LIMIT)
-    input_ids = encoded["input_ids"]
-    labels = encoded["labels"]
-    if len(input_ids) != len(labels):
-        raise ValueError(f"input_ids and labels differ in length at line {line_number}")
-
-    template_tokens = len(input_ids)
-    retained_labels = labels[-max_seq_len:]
-    # Online conversation training removes the final input token and the first label
-    # so each retained label is the next-token target of the aligned model input.
-    shifted_labels = retained_labels[1:]
-    train_tokens = len(shifted_labels)
-    supervised_tokens = sum(label != IGNORE_INDEX for label in shifted_labels)
+    if transform is None:
+        transform = TextConversationTransform(chat_template, max_seq_len, "messages", "tools")
+    messages = _normalize_conversation(_get_record_value(record, transform.text_keys))
+    tools = _normalize_tools(record.get(transform.tools_key), transform.tools_key) if transform.tools_key else None
+    full_sample = replace(transform, max_seq_len=_FULL_SEQUENCE_LIMIT)(record)[0]
+    sample = transform(record)[0]
+    template_tokens = full_sample["input_ids"].numel() + 1
+    train_tokens = sample["labels"].numel()
+    supervised_tokens = int((sample["labels"] != IGNORE_INDEX).sum())
+    full_supervised = int((full_sample["labels"] != IGNORE_INDEX).sum())
     masked_tokens = train_tokens - supervised_tokens
     supervision_ratio = supervised_tokens / train_tokens if train_tokens else 0.0
 
     raw_character_count = 0
     for message in messages:
-        raw_character_count += len(message["content"])
+        raw_character_count += len(message.get("content") or "")
         reasoning_content = message.get("reasoning_content")
         if reasoning_content is not None:
             if not isinstance(reasoning_content, str):
@@ -239,6 +271,10 @@ def analyze_record(
 
     return {
         "source_index": line_number,
+        "tool_count": len(tools or []),
+        "zero_supervision": supervised_tokens == 0,
+        "supervision_lost_to_truncation": full_supervised > 0 and supervised_tokens == 0,
+        "supervised_tokens_before_truncation": full_supervised,
         "message_count": len(messages),
         "assistant_message_count": sum(message["role"] == "assistant" for message in messages),
         "raw_character_count": raw_character_count,
@@ -284,7 +320,15 @@ def _distribution_summary(values: Sequence[float]) -> dict[str, float]:
 
 
 def build_summary(rows: Sequence[Mapping[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
-    """Build the machine-readable aggregate report."""
+    """Build the machine-readable aggregate report.
+
+    Args:
+        rows: Per-record length and supervision statistics.
+        args: Resolved analysis configuration.
+
+    Returns:
+        Aggregate distributions and effective settings.
+    """
     if not rows:
         raise ValueError("The input JSONL contained no records")
     template_lengths = [row["template_tokens_before_truncation"] for row in rows]
@@ -298,8 +342,11 @@ def build_summary(rows: Sequence[Mapping[str, Any]], args: argparse.Namespace) -
         "data_path": str(args.data_path),
         "tokenizer_path": str(args.tokenizer_path),
         "max_seq_len": args.max_seq_len,
-        "enable_thinking": not args.disable_thinking,
-        "reasoning_effort": args.reasoning_effort,
+        "chat_template_kwargs": args.template_kwargs,
+        "text_key": args.text_key,
+        "tools_key": args.tools_key,
+        "thinking_mode": args.thinking_mode,
+        "supervision_lost_to_truncation_count": sum(row["supervision_lost_to_truncation"] for row in rows),
         "sample_count": len(rows),
         "truncated_sample_count": truncated_count,
         "truncated_sample_ratio": truncated_count / len(rows),
@@ -327,7 +374,13 @@ def _bucket_counts(values: Sequence[int]) -> tuple[list[str], list[int]]:
 
 
 def plot_report(rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], output_path: Path) -> None:
-    """Write the four-panel length report to a PNG file."""
+    """Write the four-panel length report to a PNG file.
+
+    Args:
+        rows: Per-record length and supervision statistics.
+        summary: Aggregate report containing the training length limit.
+        output_path: Destination PNG path.
+    """
     # Matplotlib is optional for core training and only required by this plotting script.
     try:
         from matplotlib.backends.backend_agg import FigureCanvasAgg  # pylint: disable=C0415
@@ -372,6 +425,11 @@ def plot_report(rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], o
     scatter_train = train_lengths[::scatter_stride]
     scatter_supervised = supervised_lengths[::scatter_stride]
     axes[1, 0].scatter(scatter_train, scatter_supervised, s=8, alpha=0.22, color="#54A24B", edgecolors="none")
+    invalid_rows = [row for row in rows if row["zero_supervision"]]
+    if invalid_rows:
+        axes[1, 0].scatter([row["train_tokens_after_truncation"] for row in invalid_rows],
+                           [0] * len(invalid_rows), color="#E45756", marker="x", label="No valid labels")
+        axes[1, 0].legend()
     diagonal_max = max(train_lengths, default=1)
     axes[1, 0].plot((0, diagonal_max), (0, diagonal_max), color="#9D9D9D", linestyle="--", linewidth=1)
     axes[1, 0].set_title("Supervised tokens per training sequence")
@@ -411,6 +469,7 @@ def main() -> None:
     args.data_path = args.data_path.expanduser().resolve()
     args.tokenizer_path = args.tokenizer_path.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    template_kwargs = resolve_settings(args)
     _validate_args(args)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -422,12 +481,12 @@ def main() -> None:
     chat_template = build_chat_template(
         "tokenizer",
         tokenizer,
-        chat_template_kwargs={
-            "enable_thinking": not args.disable_thinking,
-            "reasoning_effort": args.reasoning_effort,
-        },
+        chat_template_kwargs=template_kwargs,
     )
 
+    transform = TextConversationTransform(
+        chat_template, args.max_seq_len, args.text_key, args.tools_key, args.thinking_mode,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.output_dir / "decif_length_samples.csv"
     rows = []
@@ -436,7 +495,7 @@ def main() -> None:
         writer.writeheader()
         for record_count, (line_number, record) in enumerate(_iter_jsonl(args.data_path, args.limit), start=1):
             try:
-                row = analyze_record(tokenizer, chat_template, record, line_number, args.max_seq_len)
+                row = analyze_record(tokenizer, chat_template, record, line_number, args.max_seq_len, transform)
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"Failed to analyze Decif record at line {line_number}: {exc}") from exc
             writer.writerow(row)
@@ -444,6 +503,12 @@ def main() -> None:
             if args.progress_every and record_count % args.progress_every == 0:
                 print(f"Analyzed {record_count:,} records")
 
+    invalid_path = args.output_dir / "decif_zero_supervision_samples.csv"
+    with invalid_path.open("w", encoding="utf-8", newline="") as invalid_file:
+        writer = csv.DictWriter(invalid_file, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(row for row in rows if row["zero_supervision"])
+    print(f"Wrote zero-supervision samples (source_index is the JSONL line number): {invalid_path}")
     summary = build_summary(rows, args)
     summary_path = args.output_dir / "decif_length_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -455,6 +520,7 @@ def main() -> None:
     print(f"Wrote figure: {figure_path}")
     print(f"Wrote per-sample data: {csv_path}")
     print(f"Wrote summary: {summary_path}")
+    print(f"Zero-supervision samples: {summary['zero_supervision_sample_count']}")
     print(
         "Template tokens: "
         f"p50={template_summary['p50']:.0f}, p95={template_summary['p95']:.0f}, "
