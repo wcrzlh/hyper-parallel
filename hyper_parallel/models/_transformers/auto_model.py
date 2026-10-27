@@ -305,6 +305,17 @@ class _BaseHyperAutoModelClass:
         )
 
         # Step 2: Build model
+        init_kwargs = kwargs
+        if enable_mtp:
+            # MTP constructs the complete module tree before the separate checkpoint
+            # loader runs; HF pretrained-only options are not constructor arguments.
+            init_kwargs = dict(kwargs)
+            ignore_mismatched_sizes = init_kwargs.pop("ignore_mismatched_sizes", False)
+            if ignore_mismatched_sizes:
+                logger.warning(
+                    "MTP uses the HyperParallel checkpoint loader; ignore_mismatched_sizes=True "
+                    "does not enable skipping mismatched tensors. Shape validation remains enabled."
+                )
         with init_ctx:
             _, model = _init_model(
                 cls,
@@ -315,7 +326,7 @@ class _BaseHyperAutoModelClass:
                 is_hf_model,
                 *model_args,
                 backend=backend,
-                **kwargs,
+                **init_kwargs,
             )
             if enable_mtp:
                 # Optional Qwen family dependency; attach before checkpoint mapping and FSDP.

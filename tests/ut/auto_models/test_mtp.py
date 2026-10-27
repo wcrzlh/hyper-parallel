@@ -16,15 +16,19 @@
 
 import copy
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+import yaml
 from transformers import Qwen3_5MoeTextConfig, Qwen3_5MoeForCausalLM
 
 from hyper_parallel.components.losses import ChunkedCausalLMLoss, ModelOutputLoss
 from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator
 from hyper_parallel.components.losses.mtp_objective import build_mtp_targets, validate_mtp_loss_weight
 from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import (
     attach_mtp, _mtp_full_attention_mask, mtp_distributed_setup,
 )
@@ -51,6 +55,67 @@ def make_model(depth: int = 2) -> Qwen3_5MoeForCausalLM:
 
 class TestMTP(unittest.TestCase):
     """Use a real CPU model as the eager/chunk first-order gradient oracle."""
+
+    def test_example_yaml_model_arguments(self):
+        """Exercise unchanged example model kwargs through the public entry point.
+
+        CPU scope: use a tiny config and bypass distributed setup and checkpoint
+        loading, while retaining real HF construction and MTP attachment.
+        """
+        root = Path(__file__).resolve().parents[3]
+        example = root / "examples/qwen3_6_moe/train_online_mtp.yaml"
+        settings = yaml.safe_load(example.read_text(encoding="utf-8"))
+        model_args = dict(settings["model"])
+        target = model_args.pop("_target_")
+        self.assertEqual(target, "hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained")
+        self.assertTrue(model_args["ignore_mismatched_sizes"])
+        config = make_model().config
+        module = "hyper_parallel.models._transformers.auto_model"
+        print(f"YAML: {example}")
+        print(f"Unmodified model arguments: {model_args}")
+        print("Scope: tiny CPU config; mocked infrastructure/checkpoint loading; no eight-rank training")
+        with patch(f"{module}.get_hf_config", return_value=config):
+            with patch(f"{module}.instantiate_infrastructure", return_value=(None, None)):
+                with patch(f"{module}.apply_model_infrastructure", side_effect=lambda model, **kw: model):
+                    model = HyperAutoModelForCausalLM.from_pretrained(**model_args)
+        self.assertIsInstance(model, Qwen3_5MoeForCausalLM)
+        self.assertIsNotNone(model.mtp)
+        self.assertTrue(any(name.startswith("mtp.") for name, _ in model.named_parameters()))
+        print(f"PASS: {type(model).__name__}, MTP attached, original YAML arguments accepted")
+
+    def test_mtp_pretrained_size_option_does_not_reach_constructor(self):
+        """Construct real MTP modules with either value of the HF load-only option."""
+        config = make_model().config
+        module = "hyper_parallel.models._transformers.auto_model"
+        for ignore in (False, True):
+            with self.subTest(ignore_mismatched_sizes=ignore):
+                with patch(f"{module}.apply_model_infrastructure", side_effect=lambda model, **kw: model):
+                    model = HyperAutoModelForCausalLM._build_model(
+                        "unused-checkpoint", is_hf_model=True, hf_config=config,
+                        mesh=None, sharding_planner=None, fsdp2_manager=None,
+                        backend=None, peft_config=None, torch_dtype=torch.float32,
+                        attn_implementation="sdpa", validate_placement=False,
+                        load_base_model=False, enable_mtp=True, ignore_mismatched_sizes=ignore,
+                    )
+                self.assertIsInstance(model, Qwen3_5MoeForCausalLM)
+                self.assertIsNotNone(model.mtp)
+
+    def test_non_mtp_preserves_pretrained_size_option(self):
+        """The ordinary pretrained path still receives its loading option unchanged."""
+        config = make_model().config
+        module = "hyper_parallel.models._transformers.auto_model"
+        model = torch.nn.Linear(2, 2)
+        with patch(f"{module}._init_model", return_value=(False, model)) as initialize:
+            with patch(f"{module}.apply_model_infrastructure", side_effect=lambda model, **kw: model):
+                HyperAutoModelForCausalLM._build_model(
+                    "original-checkpoint", is_hf_model=True, hf_config=config,
+                    mesh=None, sharding_planner=None, fsdp2_manager=None,
+                    backend=None, peft_config=None, torch_dtype=torch.float32,
+                    attn_implementation="sdpa", validate_placement=False,
+                    load_base_model=False, enable_mtp=False, ignore_mismatched_sizes=True,
+                )
+        self.assertEqual(initialize.call_args.args[1], "original-checkpoint")
+        self.assertTrue(initialize.call_args.kwargs["ignore_mismatched_sizes"])
 
     def setUp(self):
         torch.manual_seed(41)
