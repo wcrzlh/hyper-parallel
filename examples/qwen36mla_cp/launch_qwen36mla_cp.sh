@@ -11,8 +11,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
-OUTPUT_DIR="/data3/w00842045/output/qwen35mla-cp-train"
-CONFIG_FILE="${SCRIPT_DIR}/train_qwen35mla_cp.yaml"
+OUTPUT_DIR="/data3/w00842045/output/qwen36mla-cp-train"
+CONFIG_FILE="${SCRIPT_DIR}/train_qwen36mla_cp.yaml"
 
 export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
@@ -27,7 +27,7 @@ cd "${PROJECT_ROOT}"
 
 torchrun \
     --nproc_per_node=${NPROC} \
-    --rdzv_id=qwen35mla_cp \
+    --rdzv_id=qwen36mla_cp \
     --rdzv_backend=c10d \
     --rdzv_endpoint=127.0.0.1:29500 \
     --module examples.qwen3_8.train_text \
