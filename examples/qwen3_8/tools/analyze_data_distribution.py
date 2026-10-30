@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Analyze Decif JSONL lengths with the Qwen training conversation transform.
+"""Analyze JSONL/Parquet lengths with the Qwen training conversation transform.
+
+--data-path also accepts a directory of JSONL and/or Parquet files, sorted by
+name without recursion. --limit applies across all files. Parquet needs pyarrow.
 
 Example:
-    python -m examples.qwen3_8.tools.analyze_decif_lengths \
+    python -m examples.qwen3_8.tools.analyze_data_distribution \
         --data-path /home/chaoran/datasets/decif-30k.jsonl \
         --tokenizer-path /home/chaoran/models/Qwen3.6-35B-A3B \
         --config examples/qwen3_6_moe/train_online.yaml \
@@ -37,6 +40,7 @@ from typing import Any, Iterable
 
 import yaml
 
+from examples.qwen3_8.tools.validate_chat_templates import apply_experiment_config, collect_data_files, iter_records
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.text.build_data_transform import (
     TextConversationTransform,
@@ -50,6 +54,7 @@ from hyper_parallel.data.text.chat_template import build_chat_template
 
 _FULL_SEQUENCE_LIMIT = 2**31 - 1
 _CSV_FIELDS = (
+    "source_file",
     "source_index",
     "tool_count",
     "zero_supervision",
@@ -81,8 +86,9 @@ def parse_args() -> argparse.Namespace:
             "Measure Decif conversation lengths after the exact Qwen tokenizer chat template and loss mask."
         )
     )
-    parser.add_argument("--data-path", type=Path, required=True, help="Decif JSONL file containing messages.")
-    parser.add_argument("--tokenizer-path", type=Path, required=True, help="Local Qwen tokenizer/model directory.")
+    parser.add_argument("--data-path", type=Path,
+                        help="JSONL/Parquet file or directory (direct children, sorted; mixed formats allowed)")
+    parser.add_argument("--tokenizer-path", type=Path, help="Local Qwen tokenizer/model directory.")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -133,8 +139,7 @@ def parse_args() -> argparse.Namespace:
 
 def _validate_args(args: argparse.Namespace) -> None:
     """Validate input paths and numeric options."""
-    if not args.data_path.is_file():
-        raise ValueError(f"Decif JSONL file does not exist: {args.data_path}")
+    collect_data_files(args.data_path)
     if not args.tokenizer_path.exists():
         raise ValueError(f"Tokenizer path does not exist: {args.tokenizer_path}")
     if args.max_seq_len <= 1:
@@ -173,6 +178,24 @@ def _iter_jsonl(data_path: Path, limit: int | None) -> Iterable[tuple[int, Mappi
             emitted += 1
             if limit is not None and emitted >= limit:
                 return
+
+
+def _iter_dataset(data_path: Path, limit: int | None) -> Iterable[tuple[Path, int, Mapping[str, Any]]]:
+    """Read all sources with one global non-blank record limit and source-aware errors."""
+    emitted = 0
+    for source_path, number, raw in iter_records(collect_data_files(data_path)):
+        if isinstance(raw, str) and not raw.strip():
+            continue
+        try:
+            record = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(record, Mapping):
+                raise ValueError("Expected a JSON object")
+        except ValueError as exc:
+            raise ValueError(f"Invalid record at {source_path}:{number}: {exc}") from exc
+        yield source_path, number, record
+        emitted += 1
+        if limit is not None and emitted >= limit:
+            return
 
 
 def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
@@ -466,18 +489,20 @@ def plot_report(rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], o
 def main() -> None:
     """Analyze Decif records and write the PNG, CSV, and JSON reports."""
     args = parse_args()
+    if args.config:
+        apply_experiment_config(args)
+    elif args.data_path is None or args.tokenizer_path is None:
+        raise ValueError("Supply --config or both --data-path and --tokenizer-path")
     args.data_path = args.data_path.expanduser().resolve()
     args.tokenizer_path = args.tokenizer_path.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     template_kwargs = resolve_settings(args)
     _validate_args(args)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(args.tokenizer_path),
-        local_files_only=True,
-        use_fast=True,
-        trust_remote_code=args.trust_remote_code,
-    )
+    tokenizer_options = getattr(args, "tokenizer_kwargs", {
+        "local_files_only": True, "use_fast": True, "trust_remote_code": args.trust_remote_code,
+    })
+    tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer_path), **tokenizer_options)
     chat_template = build_chat_template(
         "tokenizer",
         tokenizer,
@@ -493,11 +518,13 @@ def main() -> None:
     with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        for record_count, (line_number, record) in enumerate(_iter_jsonl(args.data_path, args.limit), start=1):
+        for record_count, (source_path, line_number, record) in enumerate(
+                _iter_dataset(args.data_path, args.limit), start=1):
             try:
                 row = analyze_record(tokenizer, chat_template, record, line_number, args.max_seq_len, transform)
             except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"Failed to analyze Decif record at line {line_number}: {exc}") from exc
+                raise ValueError(f"Failed to analyze record at {source_path}:{line_number}: {exc}") from exc
+            row["source_file"] = str(source_path.resolve())
             writer.writerow(row)
             rows.append(row)
             if args.progress_every and record_count % args.progress_every == 0:

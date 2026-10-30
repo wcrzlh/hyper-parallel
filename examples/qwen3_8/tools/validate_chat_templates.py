@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Scan JSONL with a local tokenizer; render templates and exercise training masks.
+"""Scan JSONL/Parquet with a local tokenizer; render templates and exercise training masks.
+
+--data-path accepts a file or directory (sorted direct children, no recursion).
+Mixed JSONL/Parquet directories are supported; Parquet requires pyarrow.
+Reports include source_file and a one-based line (JSONL) or row (Parquet).
 
 Run from an editable HyperParallel installation, without torchrun or model weights:
     HYPER_PARALLEL_PLATFORM=torch python -m examples.qwen3_8.tools.validate_chat_templates \
         --data-path /path/to/data.jsonl --tokenizer-path /path/to/model \
         --tools-key tools --max-seq-len 4096 --output-dir outputs/template_check
 
-Add --config examples/qwen3_6_moe/train_online.yaml to read only
-dataset.model_assets.chat_template_kwargs (not dataset paths or sequence length).
+Add --config examples/qwen3_6_moe/train_online.yaml to read dataset paths,
+tokenizer options, conversation transform settings and chat-template kwargs.
 With --config, --template-kwargs overrides individual YAML fields; {} keeps them.
 Without --config, legacy defaults apply unless --template-kwargs is supplied;
 an explicit {} then selects tokenizer defaults. YAML interpolation is not resolved.
@@ -34,7 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import yaml
 
@@ -49,11 +53,47 @@ from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.data.text.chat_template import TokenizerTemplate
 
 
-def validate_record(line: str, line_number: int, transform: TextConversationTransform) -> dict[str, Any]:
+def collect_data_files(path: Path) -> list[Path]:
+    """Collect sorted direct-child JSONL/Parquet files without invoking training loaders."""
+    if not path.exists():
+        raise FileNotFoundError(path)
+    candidates = sorted(path.iterdir()) if path.is_dir() else [path]
+    files = [item for item in candidates if item.is_file() and item.suffix.lower() in (".jsonl", ".parquet")]
+    if not files:
+        raise ValueError(f"No JSONL or Parquet files found: {path}")
+    return files
+
+
+def iter_records(files: list[Path]) -> Iterator[tuple[Path, int, str | dict[str, Any]]]:
+    """Yield source, one-based line/row, and record; retain JSONL errors for reporting."""
+    for path in files:
+        if path.suffix.lower() == ".jsonl":
+            with path.open(encoding="utf-8") as source:
+                for number, line in enumerate(source, 1):
+                    yield path, number, line
+            continue
+        try:
+            # Parquet is an optional dependency for JSONL-only scans.
+            import pyarrow.parquet as parquet  # pylint: disable=C0415
+        except ImportError as exc:
+            raise RuntimeError("Reading Parquet requires pyarrow; install it with pip install pyarrow") from exc
+        try:
+            with parquet.ParquetFile(path) as source:
+                number = 0
+                for batch in source.iter_batches(batch_size=1024):
+                    for record in batch.to_pylist():
+                        number += 1
+                        yield path, number, record
+        except Exception as exc:
+            raise ValueError(f"Failed to read Parquet file {path}: {exc}") from exc
+
+
+def validate_record(line: str | dict[str, Any], line_number: int,
+                    transform: TextConversationTransform) -> dict[str, Any]:
     """Render and encode a record, retaining its stage and error instead of aborting the scan.
 
     Args:
-        line: One non-empty JSONL line.
+        line: One non-empty JSONL line or decoded Parquet row.
         line_number: One-based physical line number in the source file.
         transform: The actual conversation transform used by training.
 
@@ -62,7 +102,7 @@ def validate_record(line: str, line_number: int, transform: TextConversationTran
     """
     result = {"line": line_number, "render_ok": False, "training_ok": False, "stage": "json"}
     try:
-        record = json.loads(line)
+        record = json.loads(line) if isinstance(line, str) else line
         if not isinstance(record, dict):
             raise ValueError("Each JSONL record must be an object")
         result["stage"] = "normalize"
@@ -103,7 +143,7 @@ def scan_dataset(
     """Scan all non-empty lines and write templates.jsonl, errors.jsonl, and summary.json.
 
     Args:
-        data_path: Input JSONL file, never modified.
+        data_path: Input JSONL/Parquet file or directory, never modified.
         output_dir: New output directory; an existing directory is rejected.
         transform: Configured training transform.
         metadata: Tokenizer and configuration provenance for the summary.
@@ -112,19 +152,19 @@ def scan_dataset(
     Returns:
         Summary with counts and an explicit all_passed flag.
     """
-    if not data_path.is_file():
-        raise FileNotFoundError(data_path)
+    files = collect_data_files(data_path)
     output_dir.mkdir(parents=True, exist_ok=False)
     summary = {"configuration": metadata, "checked": 0, "blank_lines": 0, "render_passed": 0,
                "training_passed": 0, "failed": 0, "zero_supervision": 0}
-    with data_path.open(encoding="utf-8") as source, \
-            (output_dir / "templates.jsonl").open("x", encoding="utf-8") as rendered, \
+    summary["source_files"] = [str(path.resolve()) for path in files]
+    with (output_dir / "templates.jsonl").open("x", encoding="utf-8") as rendered, \
             (output_dir / "errors.jsonl").open("x", encoding="utf-8") as errors:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
+        for source_path, line_number, line in iter_records(files):
+            if isinstance(line, str) and not line.strip():
                 summary["blank_lines"] += 1
                 continue
             result = validate_record(line, line_number, transform)
+            result["source_file"] = str(source_path.resolve())
             rendered.write(json.dumps(result, ensure_ascii=False) + "\n")
             summary["checked"] += 1
             summary["render_passed"] += int(result["render_ok"])
@@ -174,26 +214,78 @@ def _resolve_template_kwargs(config_path: Path | None, overrides: str | None) ->
     return options
 
 
+def apply_experiment_config(args: argparse.Namespace) -> None:
+    """Resolve offline scan inputs from YAML; explicit CLI fields override YAML.
+
+    Relative paths use the invocation directory, like the training entry point.
+    Only native-tokenizer conversation configs are supported, without instantiating
+    training builders or executing YAML targets.
+    """
+    dataset = {}
+    if args.config:
+        with args.config.open(encoding="utf-8") as source:
+            config = yaml.safe_load(source)
+        if not isinstance(config, dict) or not isinstance(config.get("dataset"), dict):
+            raise ValueError("config.dataset must be a mapping")
+        dataset = config["dataset"]
+    assets = dataset.get("model_assets", {})
+    transform = dataset.get("data_transform", {})
+    if not isinstance(assets, dict) or not isinstance(transform, dict):
+        raise ValueError("model_assets and data_transform must be mappings")
+    if transform.get("data_type", "conversation") != "conversation":
+        raise ValueError("Only conversation data is supported")
+    if assets.get("chat_template", "tokenizer") != "tokenizer":
+        raise ValueError("Only native tokenizer chat templates are supported")
+    tokenizer = dict(assets.get("tokenizer", {}))
+    tokenizer.pop("_target_", None)
+    tokenizer_path = tokenizer.pop("pretrained_model_name_or_path", None)
+    args.data_path = args.data_path or dataset.get("data_path")
+    args.tokenizer_path = args.tokenizer_path or tokenizer_path
+    if not isinstance(args.data_path, (str, Path)) or not args.tokenizer_path:
+        raise ValueError("Supply data_path and tokenizer path through --config or CLI (single file/directory)")
+    args.data_path = Path(args.data_path).expanduser()
+    args.tokenizer_path = Path(args.tokenizer_path).expanduser()
+    args.text_key = args.text_key if args.text_key is not None else transform.get(
+        "text_keys", "text" if args.config else "messages")
+    if not isinstance(args.text_key, str):
+        raise ValueError("Offline validation currently requires a single text_keys field")
+    args.tools_key = args.tools_key if args.tools_key is not None else transform.get(
+        "tools_key", None if args.config else "tools")
+    args.max_seq_len = args.max_seq_len if args.max_seq_len is not None else transform.get("max_seq_len", 4096)
+    args.thinking_mode = args.thinking_mode or transform.get("thinking_mode", "legacy")
+    args.tokenizer_kwargs = {"local_files_only": True, "use_fast": True, "trust_remote_code": False, **tokenizer}
+
+
 def parse_args() -> argparse.Namespace:
     """Parse local-only tokenizer and dataset options, matching the Qwen training defaults."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data-path", type=Path, required=True)
-    parser.add_argument("--tokenizer-path", type=Path, required=True,
+    parser.add_argument("--data-path", type=Path,
+                        help="JSONL/Parquet file or directory (direct children, sorted; mixed formats allowed)")
+    parser.add_argument("--tokenizer-path", type=Path,
                         help="Local model/tokenizer directory; no weights loaded")
     parser.add_argument("--output-dir", type=Path, required=True, help="New directory; contains private rendered data")
-    parser.add_argument("--text-key", default="messages")
-    parser.add_argument("--tools-key", default="tools", help="Top-level tools field; pass an empty string to disable")
-    parser.add_argument("--max-seq-len", type=int, default=4096, help="Training truncation limit before label shift")
+    parser.add_argument("--text-key")
+    parser.add_argument("--tools-key", help="Top-level tools field; pass an empty string to disable")
+    parser.add_argument("--thinking-mode", choices=("legacy", "auto"))
+    parser.add_argument("--max-seq-len", type=int, help="Training truncation limit before label shift")
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--config", type=Path,
-                        help="Training YAML; read only dataset.model_assets.chat_template_kwargs")
+                        help="Experiment YAML: dataset paths, tokenizer, transform and template options")
     parser.add_argument("--template-kwargs",
                         help="JSON options: override YAML fields with --config; otherwise replace legacy defaults")
     args = parser.parse_args()
+    try:
+        apply_experiment_config(args)
+    except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
+        parser.error(f"Invalid template configuration: {exc}")
     if args.max_seq_len < 2 or args.progress_every < 0:
         parser.error("max-seq-len must be >= 2 and progress-every must be >= 0")
-    if not args.data_path.is_file() or not args.tokenizer_path.is_dir():
-        parser.error("data-path must be a file and tokenizer-path must be a local directory")
+    try:
+        collect_data_files(args.data_path)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    if not args.tokenizer_path.is_dir():
+        parser.error("tokenizer-path must be a local directory")
     if args.output_dir.exists():
         parser.error("output-dir already exists; choose a new directory to preserve previous results")
     try:
@@ -207,13 +299,14 @@ def main() -> int:
     """Run the CPU-only full scan and return a nonzero exit status on failures."""
     args = parse_args()
     try:
-        tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer_path), local_files_only=True,
-                                                 use_fast=True, trust_remote_code=False)
+        tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer_path), **args.tokenizer_kwargs)
         template = TokenizerTemplate(tokenizer, chat_template_kwargs=args.template_kwargs)
-        transform = TextConversationTransform(template, args.max_seq_len, args.text_key, args.tools_key or None)
+        transform = TextConversationTransform(template, args.max_seq_len, args.text_key,
+                                              args.tools_key or None, args.thinking_mode)
         metadata = {"data_path": str(args.data_path.resolve()), "tokenizer_path": str(args.tokenizer_path.resolve()),
                     "hyper_parallel_path": hyper_parallel.__file__, "text_key": args.text_key,
                     "tools_key": args.tools_key or None, "max_seq_len": args.max_seq_len,
+                    "thinking_mode": args.thinking_mode, "tokenizer_kwargs": args.tokenizer_kwargs,
                     "template_kwargs": args.template_kwargs,
                     "config_path": str(args.config.resolve()) if args.config else None}
         summary = scan_dataset(args.data_path, args.output_dir, transform, metadata, args.progress_every)
