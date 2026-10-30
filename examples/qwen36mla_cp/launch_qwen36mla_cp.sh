@@ -1,36 +1,42 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
-# ============================================================
-# Qwen3.6-35B-A3B-kvfirst-mla 长序列 CP 训练启动脚本
-# 模型: Qwen3.6-35B-A3B-kvfirst-mla-gkd-thinking (V2 SFT 基座)
-# 数据: sft_hybrid_long_16k_plus.jsonl (14963 条, 16K-44K tokens)
-# 拓扑: 16 chips, CP=2, FSDP=8, EP=1
-# CP: full_attn→sdpa_hf_ulysses, linear_attn→gdn_ulysses
-# ============================================================
+set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
-OUTPUT_DIR="/data3/w00842045/output/qwen36mla-cp-train"
-CONFIG_FILE="${SCRIPT_DIR}/train_qwen36mla_cp.yaml"
+
+MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+MASTER_PORT=${MASTER_PORT:-29500}
+RDZV_ID=${RDZV_ID:-qwen36mla_cp_1node_16dies}
 
 export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
+export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
 
 NPROC=${NPROC:-16}
 
-mkdir -p "${OUTPUT_DIR}"
-
 cd "${PROJECT_ROOT}"
-
 torchrun \
-    --nproc_per_node=${NPROC} \
-    --rdzv_id=qwen36mla_cp \
+    --nproc_per_node="${NPROC}" \
+    --rdzv_id="${RDZV_ID}" \
     --rdzv_backend=c10d \
-    --rdzv_endpoint=127.0.0.1:29500 \
+    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module examples.qwen3_8.train_text \
-    "${CONFIG_FILE}" \
-    "$@" \
-    2>&1 | tee "${OUTPUT_DIR}/train.log"
+    "${SCRIPT_DIR}/train_qwen36mla_cp.yaml" \
+    "$@"
