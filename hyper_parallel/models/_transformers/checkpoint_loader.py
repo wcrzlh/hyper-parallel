@@ -728,6 +728,16 @@ class CheckpointManager:
         # HF overwrites architectures/dtype during saving. The shallow module
         # copy shares parameters without allocating weights, but not metadata.
         export_model.config = deepcopy(self.model.config)
+        if (
+            export_model.config.model_type in ("qwen3_5_text", "qwen3_5_moe_text")
+            and getattr(self.model, "_hp_mtp_enabled", False)
+        ):
+            # vLLM normalizes the text target to 1D RoPE, but reloads the MTP
+            # draft config separately. Export both with the same RoPE contract.
+            rope_parameters = getattr(export_model.config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                rope_parameters.pop("mrope_section", None)
+                rope_parameters.pop("mrope_interleaved", None)
         if getattr(self.model, "generation_config", None) is not None:
             export_model.generation_config = deepcopy(self.model.generation_config)
         return export_model
