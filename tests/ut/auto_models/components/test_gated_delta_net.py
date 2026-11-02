@@ -23,6 +23,7 @@ from torch import nn
 
 from hyper_parallel.components.modules import TritonGDN
 from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
+from hyper_parallel.distributed.context_parallel import gated_delta_net as cp_gdn
 
 
 def _original_rule(query, key, value, **kwargs):
@@ -92,9 +93,9 @@ class TestGatedDeltaNet(unittest.TestCase):
         mesh = SimpleNamespace(size=lambda: 2)
         cp_wrappers.gdn_ulysses_cp_wrapper(replacement, None, None, mesh, None)
         inputs = torch.ones(1, 4, 2, 3, requires_grad=True)
-        with patch.object(cp_wrappers, "_gdn_cp_causal_conv1d", side_effect=lambda fn, mesh, x, *a, **kw: x), \
-                patch.object(cp_wrappers, "_gdn_rule_cp_to_hp", side_effect=lambda *args: args[:5]), \
-                patch.object(cp_wrappers, "_gdn_rule_hp_to_cp", side_effect=lambda x, *a, **kw: x):
+        with patch.object(cp_gdn, "_gdn_cp_causal_conv1d", side_effect=lambda fn, mesh, x, *a, **kw: x), \
+                patch.object(cp_gdn, "_gdn_rule_cp_to_hp", side_effect=lambda *args: args[:5]), \
+                patch.object(cp_gdn, "_gdn_rule_hp_to_cp", side_effect=lambda x, *a, **kw: x):
             replacement(inputs).sum().backward()
         triton_rule.assert_called_once()
         self.assertIs(replacement.chunk_gated_delta_rule, triton_rule)

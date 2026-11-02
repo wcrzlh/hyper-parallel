@@ -17,6 +17,7 @@
 import torch
 
 from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
+from hyper_parallel.distributed.context_parallel import gated_delta_net as cp_gdn
 from hyper_parallel.distributed.recipe_spec import (
     MeshAxisName,
 )
@@ -138,9 +139,9 @@ def test_gdn_wrapper_intercepts_primitives_without_copying_forward(monkeypatch):
         calls["to_cp"] += 1
         return output
 
-    monkeypatch.setattr(cp_wrappers, "_gdn_cp_causal_conv1d", fake_cp_conv)
-    monkeypatch.setattr(cp_wrappers, "_gdn_rule_cp_to_hp", fake_to_hp)
-    monkeypatch.setattr(cp_wrappers, "_gdn_rule_hp_to_cp", fake_to_cp)
+    monkeypatch.setattr(cp_gdn, "_gdn_cp_causal_conv1d", fake_cp_conv)
+    monkeypatch.setattr(cp_gdn, "_gdn_rule_cp_to_hp", fake_to_hp)
+    monkeypatch.setattr(cp_gdn, "_gdn_rule_hp_to_cp", fake_to_cp)
 
     module = FakeGatedDeltaNet()
     original_conv = causal_conv1d_fn
@@ -164,7 +165,7 @@ def test_gdn_wrapper_intercepts_primitives_without_copying_forward(monkeypatch):
 
 def test_gdn_halo_exchange_uses_torch_collective_adapter(monkeypatch):
     """The rebased wrapper routes halo exchange through Torch collectives."""
-    tail = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    tail = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
     calls = {}
 
     class FakeMesh:
@@ -195,21 +196,21 @@ def test_gdn_halo_exchange_uses_torch_collective_adapter(monkeypatch):
             output_splits=output_splits,
             group=group,
         )
-        return torch.full_like(tail, 7)
+        return torch.full_like(tail.permute(2, 0, 1), 7)
 
-    monkeypatch.setattr(cp_wrappers.dist, "get_process_group_ranks", lambda _group: (0, 1))
+    monkeypatch.setattr(cp_gdn.dist, "get_process_group_ranks", lambda _group: (0, 1))
     monkeypatch.setattr(
-        cp_wrappers._collectives,
+        cp_gdn.communication,
         "differentiable_all_to_all_single",
         fake_all_to_all_single,
     )
 
-    result = cp_wrappers._exchange_previous_cp_halo(tail, FakeMesh())
+    result = cp_gdn._exchange_previous_cp_halo(tail, FakeMesh())
 
     torch.testing.assert_close(result, torch.full_like(tail, 7))
-    torch.testing.assert_close(calls["input_tensor"], tail[:0])
+    torch.testing.assert_close(calls["input_tensor"], tail.permute(2, 0, 1)[:0])
     assert calls["input_splits"] == [0, 0]
-    assert calls["output_splits"] == [2, 0]
+    assert calls["output_splits"] == [3, 0]
     assert calls["group"] == "cp_group"
 
 
@@ -235,18 +236,18 @@ def test_qwen_gdn_roles_are_adapter_owned():
 def test_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):
     """The wrapper supports the decorated Transformers 5.13 call structure."""
     monkeypatch.setattr(
-        cp_wrappers,
+        cp_gdn,
         "_gdn_cp_causal_conv1d",
         lambda original, cp_mesh, *args, **kwargs: original(*args, **kwargs),
     )
     monkeypatch.setattr(
-        cp_wrappers,
+        cp_gdn,
         "_gdn_rule_cp_to_hp",
         lambda query, key, value, decay, beta, cp_mesh: (
             query, key, value, decay, beta),
     )
     monkeypatch.setattr(
-        cp_wrappers,
+        cp_gdn,
         "_gdn_rule_hp_to_cp",
         lambda output, cp_mesh: output,
     )

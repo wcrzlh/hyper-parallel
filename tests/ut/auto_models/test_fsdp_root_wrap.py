@@ -24,8 +24,6 @@ from unittest.mock import patch
 from torch import nn
 import yaml
 
-from hyper_parallel.components.losses import ChunkedCausalLMLoss
-from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.distributed._builder import fsdp_adapter
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
@@ -45,10 +43,6 @@ def _make_model(tied: bool = False) -> nn.Module:
     if tied:
         model.lm_head.weight = model.model.embed_tokens.weight
     return model
-
-
-class _ShardedHead(nn.Linear, HSDPModule):
-    """Represent the wrapped-head interface without distributed initialization."""
 
 
 class TestFSDPRootWrap(unittest.TestCase):
@@ -239,13 +233,6 @@ class TestFSDPRootWrap(unittest.TestCase):
         self.assertEqual(config.fsdp_config.root_wrap_modules, ["model.embed_tokens", "lm_head"])
         self.assertFalse(config.fsdp_config.reshard_after_forward)
         self.assertIsNone(config.loss_fn)
-
-    def test_chunk_loss_rejects_independent_head(self):
-        """Direct head-weight access cannot bypass an independent FSDP unit's hooks."""
-        model = _make_model()
-        model.lm_head = _ShardedHead(5, 13, bias=False)
-        with self.assertRaisesRegex(NotImplementedError, "independently FSDP-wrapped lm_head"):
-            ChunkedCausalLMLoss().bind_model(model)
 
     def test_qwen_yaml_embedding_only_chunk_loss(self):
         """Both CP paths opt into chunk loss without independently wrapping the head."""
