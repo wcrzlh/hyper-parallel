@@ -206,6 +206,10 @@ class FSDP2MixedPrecisionConfig:
 class FSDP2Config:
     """FSDP2 strategy configuration (06 §4.1).
 
+    ``wrapper_class`` selects child units by exact runtime class name. An empty
+    list retains automatic decoder discovery; expert units are discovered in
+    either mode.
+
     ``root_wrap_modules`` adds exact module FQNs (for example,
     ``model.embed_tokens`` and ``lm_head``) as independent child units. Their
     reshard policy follows ``reshard_after_forward``. Parameters shared outside
@@ -228,9 +232,15 @@ class FSDP2Config:
     comm_fusion_zero_copy: Optional[bool] = None
     # Exact module FQNs to wrap independently in addition to decoder blocks.
     root_wrap_modules: list[str] = field(default_factory=list)
+    # Exact runtime class names; empty preserves automatic decoder discovery.
+    wrapper_class: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate topology sizes and prefetch depths."""
+        if not isinstance(self.wrapper_class, list) or any(
+            not isinstance(name, str) or not name.isidentifier() for name in self.wrapper_class
+        ):
+            raise ValueError("wrapper_class must be a list of module class names")
         if self.dp_shard_size < 1:
             raise ValueError("dp_shard_size must be greater than or equal to 1")
         if self.edp_shard_size < 1:

@@ -79,7 +79,7 @@ class TestBuildOptionsFields(unittest.TestCase):
                 "reshard_after_backward", "requires_grad_sync",
                 "backward_prefetch_depth", "forward_prefetch_depth",
                 "comm_fusion", "comm_fusion_zero_copy",
-                "root_wrap_modules",
+                "root_wrap_modules", "wrapper_class",
             ],
         )
         config = FSDP2Config()

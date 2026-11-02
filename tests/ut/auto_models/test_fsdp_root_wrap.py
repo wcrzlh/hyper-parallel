@@ -30,6 +30,7 @@ from hyper_parallel.distributed._builder import fsdp_adapter
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.trainer.config.parser import parse_training_args
+from tests.common.mark_utils import arg_mark
 
 
 def _make_model(tied: bool = False) -> nn.Module:
@@ -55,6 +56,61 @@ class TestFSDPRootWrap(unittest.TestCase):
 
     def _manager(self, **kwargs) -> FSDP2Manager:
         return FSDP2Manager(FSDP2Config(**kwargs), SimpleNamespace(fsdp_moe_mesh=None, tp_size=1))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_manual_classes_preserve_expert_units(self):
+        """Feature: manual wrap. Description: select a parent with EP. Expectation: retain experts."""
+        model = _make_model()
+        model.model.layers[0].experts = nn.Linear(5, 5)
+        manager = self._manager(wrapper_class=["ModuleList", "Embedding"])
+        manager.mesh_context.fsdp_moe_mesh = object()
+        metadata = {model.model.layers[0].experts.weight:
+                    SimpleNamespace(mesh=SimpleNamespace(mesh_dim_names=("edp_shard", "ep")))}
+        units = manager._find_wrap_modules(model, metadata)
+        self.assertEqual([unit.fqn for unit in units],
+                         ["model.embed_tokens", "model.layers", "model.layers.0.experts"])
+        owners = manager._resolve_parameter_owners(model, units)
+        self.assertIs(owners[model.model.layers[0].experts.weight], model.model.layers[0].experts)
+        self.assertIs(owners[model.model.layers[1].weight], model.model.layers)
+        self.assertIs(owners[model.lm_head.weight], model)
+        dense_mesh, expert_mesh = object(), object()
+        def _mesh_for_unit(expert=False):
+            return expert_mesh if expert else dense_mesh
+        def _source_for_unit(_manager, module, *_args):
+            return metadata if module is model.model.layers[0].experts else None
+        with patch.object(manager, "_build_fsdp_actual_mesh", side_effect=_mesh_for_unit), \
+                patch.object(fsdp_adapter, "_build_source_shard_info_by_param", return_value=metadata), \
+                patch.object(fsdp_adapter, "_build_managed_source_shard_info", side_effect=_source_for_unit), \
+                patch.object(fsdp_adapter, "_source_infos_for_fully_shard", return_value=None), \
+                patch.object(manager, "_configure_source_layout_gradient_scaling", return_value=False), \
+                patch.object(manager, "_configure_prefetch"), \
+                patch.object(fsdp_adapter, "fully_shard") as shard:
+            manager.parallelize(model)
+        calls = shard.call_args_list
+        self.assertIs(calls[0].args[0], model.model.layers[0].experts)
+        self.assertIs(calls[0].kwargs["mesh"], expert_mesh)
+        self.assertIs(calls[-1].args[0], model)
+        self.assertTrue(all(call.kwargs["mesh"] is dense_mesh for call in calls[1:]))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_manual_classes_validate_and_handle_checkpoint_wrapper(self):
+        """Feature: class selection. Description: invalid and wrapped inputs. Expectation: safe selection."""
+        for names in ("Linear", [""], [7]):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                FSDP2Config(wrapper_class=names)
+        with self.assertRaisesRegex(ValueError, "matched no child"):
+            self._manager(wrapper_class=["MissingClass"])._find_wrap_modules(_make_model())
+        with self.assertRaisesRegex(ValueError, "shares parameters"):
+            self._manager(wrapper_class=["Embedding"])._find_wrap_modules(_make_model(tied=True))
+        model = _make_model()
+        wrapper = nn.Module()
+        wrapper._checkpoint_wrapped_module = model.model.layers[0]
+        model.model.layers[0] = wrapper
+        units = self._manager(wrapper_class=["Linear", "Linear"])._find_wrap_modules(model)
+        self.assertEqual([unit.fqn for unit in units], ["model.layers.0", "model.layers.1", "lm_head"])
+        self.assertIs(units[0].module, wrapper)
 
     def test_default_owners_unchanged(self):
         """Old configs retain embedding, head and final norm on the root."""
@@ -174,8 +230,11 @@ class TestFSDPRootWrap(unittest.TestCase):
             config = parse_training_args([
                 str(path), "--fsdp_config.root_wrap_modules=[model.embed_tokens,lm_head]",
                 "--fsdp_config.reshard_after_forward=false",
+                "--fsdp_config.wrapper_class=[Linear,Embedding]",
             ])
         self.assertEqual(yaml_config.fsdp_config.root_wrap_modules, ["model.embed_tokens"])
+        self.assertEqual(yaml_config.fsdp_config.wrapper_class, [])
+        self.assertEqual(config.fsdp_config.wrapper_class, ["Linear", "Embedding"])
         self.assertTrue(yaml_config.fsdp_config.reshard_after_forward)
         self.assertEqual(config.fsdp_config.root_wrap_modules, ["model.embed_tokens", "lm_head"])
         self.assertFalse(config.fsdp_config.reshard_after_forward)
