@@ -105,7 +105,7 @@ class TestGDNCPBatch(unittest.TestCase):
     def test_training_yaml_selects_mixed_cp(self):
         """Parse the real training YAML so config drift cannot silently restore Ulysses."""
         root = Path(__file__).resolve().parents[5]
-        config_path = root / "examples/qwen3_8/train_online_p2p_kv_allgather.yaml"
+        config_path = root / "hyper_parallel/models/qwen3_8/recipes/train_online_p2p_kv_allgather.yaml"
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         # Resolve the actual CP/batch entries without loading dataset C++ helpers
         # or model assets, neither of which belongs to this CPU contract test.

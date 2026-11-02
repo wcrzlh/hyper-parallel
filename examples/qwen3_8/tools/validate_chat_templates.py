@@ -19,7 +19,7 @@ Run from an editable HyperParallel installation, without torchrun or model weigh
         --data-path /path/to/data.jsonl --tokenizer-path /path/to/model \
         --tools-key tools --max-seq-len 4096 --output-dir outputs/template_check
 
-Add --config examples/qwen3_6_moe/train_online.yaml to read only
+Add --config hyper_parallel/models/qwen3_6_moe/recipes/train_online.yaml to read only
 dataset.model_assets.chat_template_kwargs (not dataset paths or sequence length).
 With --config, --template-kwargs overrides individual YAML fields; {} keeps them.
 Without --config, legacy defaults apply unless --template-kwargs is supplied;

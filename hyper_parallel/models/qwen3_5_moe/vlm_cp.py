@@ -118,8 +118,15 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         if batch.get("cu_seq_lens") is not None and batch["cu_seq_lens"].numel() > 2:
             raise NotImplementedError("Qwen VLM CP does not support packed conversations")
         mask = batch.get("attention_mask", torch.ones_like(ids))
-        if not bool(mask.bool().all()):
-            raise ValueError("Provide an unpadded conversation; QwenVLMParallelBatch owns tail padding")
+        if mask.shape != ids.shape or not bool(mask[:, 0].all()):
+            raise ValueError("Qwen VLM CP requires a nonempty conversation without left padding")
+        valid = mask.bool()
+        if bool((valid[:, 1:] & ~valid[:, :-1]).any()):
+            raise ValueError("Qwen VLM CP does not support interior padding")
+        if bool((batch["labels"][~valid] != -100).any()):
+            raise ValueError("Qwen VLM CP padding must not contain supervised labels")
+        if bool((ids[~valid] == self.model.config.image_token_id).any()):
+            raise ValueError("Qwen VLM CP padding must not contain image placeholders")
         batch["attention_mask"] = mask
         pad = (-ids.shape[1]) % self.sequence_alignment
         for field, value in tuple(batch.items()):

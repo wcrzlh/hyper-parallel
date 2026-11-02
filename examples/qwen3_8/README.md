@@ -9,12 +9,12 @@ GDN 融合算子。三份训练 YAML 通过 `plan_overrides[*].replace.implement
 - [`launch_1node_8dies.sh`](launch_1node_8dies.sh) **只启动 online** `train_online.yaml`，接受 Trainer 的
   `--section.field=value` 覆盖参数。
 - [`launch_32nodes_256dies.sh`](launch_32nodes_256dies.sh) 启动 32 节点、256 卡的 online 训练。
-- [`train.yaml`](train.yaml) 是 offline Indexed Dataset 配置，默认 FSDP+CP=2、4096 token；直接用
+- [`train.yaml`](../../hyper_parallel/models/qwen3_8/recipes/train.yaml) 是 offline Indexed Dataset 配置，默认 FSDP+CP=2、4096 token；直接用
   `torchrun` 启动。
-- [`train_online.yaml`](train_online.yaml) 是 online conversation 配置，默认 FSDP+CP=2、每条样本最多
+- [`train_online.yaml`](../../hyper_parallel/models/qwen3_8/recipes/train_online.yaml) 是 online conversation 配置，默认 FSDP+CP=2、每条样本最多
   4096 token、`micro_batch_size=1`，**不做跨样本 packing**。
 
-- [`train_online_p2p_kv_allgather.yaml`](train_online_p2p_kv_allgather.yaml) 使用 GDN 状态 P2P 和
+- [`train_online_p2p_kv_allgather.yaml`](../../hyper_parallel/models/qwen3_8/recipes/train_online_p2p_kv_allgather.yaml) 使用 GDN 状态 P2P 和
   attention KV all-gather；批处理会按 CP 大小和 64-token chunk 对齐。
 
 三份配置均通过 `scripts.train_lm` 启动。
@@ -173,7 +173,7 @@ export MODEL_DIR=/path/to/Qwen3.8-27B
 
 # 纯 FSDP：8 卡、CP=1。
 torchrun --standalone --nproc_per_node=8 \
-  -m scripts.train_lm examples/qwen3_8/train.yaml \
+  -m scripts.train_lm hyper_parallel/models/qwen3_8/recipes/train.yaml \
   --training.train_iters=100 --accelerator.cp_size=1 \
   --model.pretrained_model_name_or_path="$MODEL_DIR" \
   --dataset.model_assets.tokenizer.pretrained_model_name_or_path="$MODEL_DIR" \
@@ -181,7 +181,7 @@ torchrun --standalone --nproc_per_node=8 \
 
 # FSDP+CP：8 卡、CP=2。上一组退出后再启动；不要同时占用同一批 NPU。
 torchrun --standalone --nproc_per_node=8 \
-  -m scripts.train_lm examples/qwen3_8/train.yaml \
+  -m scripts.train_lm hyper_parallel/models/qwen3_8/recipes/train.yaml \
   --training.train_iters=100 --accelerator.cp_size=2 \
   --model.pretrained_model_name_or_path="$MODEL_DIR" \
   --dataset.model_assets.tokenizer.pretrained_model_name_or_path="$MODEL_DIR" \

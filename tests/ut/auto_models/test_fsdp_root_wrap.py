@@ -162,7 +162,7 @@ class TestFSDPRootWrap(unittest.TestCase):
 
     def test_cli_overrides_reach_fsdp_config(self):
         """The real Trainer parser accepts both new fields without changing YAML defaults."""
-        yaml_path = Path(__file__).resolve().parents[3] / "examples/qwen3_8/train_online.yaml"
+        yaml_path = Path(__file__).resolve().parents[3] / "hyper_parallel/models/qwen3_8/recipes/train_online.yaml"
         raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         # Exercise the real config types without importing dataset native helpers.
         raw = {key: raw[key] for key in ("model", "optimizer", "fsdp_config")}
@@ -190,14 +190,14 @@ class TestFSDPRootWrap(unittest.TestCase):
 
     def test_qwen_yaml_embedding_only_chunk_loss(self):
         """Both CP paths opt into chunk loss without independently wrapping the head."""
-        examples = Path(__file__).resolve().parents[3] / "examples"
-        files = ["qwen3_8/train.yaml"] + [
-            f"{family}/{name}" for family in ("qwen3_8", "qwen3_6_moe")
+        models = Path(__file__).resolve().parents[3] / "hyper_parallel/models"
+        files = ["qwen3_8/recipes/train.yaml"] + [
+            f"{family}/recipes/{name}" for family in ("qwen3_8", "qwen3_6_moe")
             for name in ("train_online.yaml", "train_online_p2p_kv_allgather.yaml")
         ]
         for filename in files:
             with self.subTest(config=filename):
-                raw = yaml.safe_load((examples / filename).read_text(encoding="utf-8"))
+                raw = yaml.safe_load((models / filename).read_text(encoding="utf-8"))
                 self.assertEqual(raw["fsdp_config"]["root_wrap_modules"], ["model.embed_tokens"])
                 self.assertTrue(raw["fsdp_config"]["reshard_after_forward"])
                 self.assertEqual(raw["loss_fn"]["_target_"],

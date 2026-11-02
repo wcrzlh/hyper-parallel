@@ -89,6 +89,7 @@ compile:
   enabled: false
 
 dataset:
+  training_mode: sft
   model_assets:
     _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
     pretrained_model_name_or_path: path/to/model_weights

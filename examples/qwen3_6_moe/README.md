@@ -133,7 +133,7 @@ bash examples/qwen3_6_moe/launch_1node_8dies.sh \
 ## 5. 多模态单机 8 卡参考
 
 [`launch_vlm_1node_8dies.sh`](launch_vlm_1node_8dies.sh) 加载
-[`train_online_vlm.yaml`](train_online_vlm.yaml)。
+[`train_online_vlm.yaml`](../../hyper_parallel/models/qwen3_6_moe/recipes/train_online_vlm.yaml)。
 
 先 source CANN 并激活安装了本仓库的 Python 环境，再运行：
 

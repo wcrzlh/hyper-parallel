@@ -27,6 +27,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 
 from hyper_parallel.components.losses import ChunkedCausalLMLoss
+from hyper_parallel.data.batching.build_collate_fn import OmniCollator
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter
 from hyper_parallel.models.qwen3_5.adapter.registration import QWEN3_5_ADAPTER_SPEC
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import bind_chunk_loss
@@ -97,6 +98,34 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
                 batcher.bind_model(model)
                 self.assertEqual(model.forward, installed_forward)
                 self.assertIs(batcher.model, model)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_public_collator_tail_padding(self) -> None:
+        """Feature: Qwen VLM collation after topology alignment.
+
+        Description: Feed an odd-length sample through the public CP collator.
+        Expectation: Tail padding is preserved; invalid padding is rejected.
+        """
+        batcher = QwenVLMParallelBatch.__new__(QwenVLMParallelBatch)
+        batcher.sequence_alignment = 128
+        batcher.bind_model(make_model(dense=self.dense))
+        sample = {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([-100, 2, 3]),
+                  "attention_mask": torch.ones(3, dtype=torch.long)}
+        collated = OmniCollator(alignment_size=2)([sample])
+        self.assertEqual(collated["input_ids"].shape, (1, 4))
+        padded = batcher._pad(collated)
+        self.assertEqual(padded["input_ids"].shape, (1, 128))
+        self.assertTrue(torch.equal(padded["labels"][0, :3], sample["labels"]))
+        self.assertTrue(bool((padded["labels"][0, 3:] == -100).all()))
+        self.assertEqual(padded["attention_mask"].sum().item(), 3)
+        for mask in ([0, 1, 1, 0], [1, 0, 1, 0], [0, 0, 0, 0]):
+            with self.subTest(mask=mask), self.assertRaises(ValueError):
+                batcher._pad({**collated, "attention_mask": torch.tensor([mask])})
+        with self.assertRaisesRegex(ValueError, "supervised labels"):
+            batcher._pad({**collated, "labels": torch.tensor([[-100, 2, 3, 4]])})
+        with self.assertRaisesRegex(ValueError, "image placeholders"):
+            batcher._pad({**collated, "input_ids": torch.tensor([[1, 2, 3, 99]])})
 
     def setUp(self) -> None:
         """Use a fixed seed and one CPU thread for the small numerical oracle."""
