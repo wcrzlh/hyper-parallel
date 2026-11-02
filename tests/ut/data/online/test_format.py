@@ -18,12 +18,35 @@ import copy
 import unittest
 
 from hyper_parallel.data.constants import ONLINE_SOURCE_PATH_KEY
-from hyper_parallel.data.online.format import convert_sharegpt_to_messages, normalize_conversation
+from hyper_parallel.data.online.format import InstructionMessages, convert_sharegpt_to_messages, normalize_conversation
 from tests.common.mark_utils import arg_mark
 
 
 class TestConversationFormat(unittest.TestCase):
     """Keep text and media conversion contracts independent of tokenization."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_instruction_messages_preserve_fields_and_separator(self):
+        """Feature: Instruction formatting.
+
+        Description: Convert mapped fields without tokenization or mutation.
+        Expectation: Preserve input semantics and reject invalid configuration.
+        """
+        formatter = InstructionMessages({"instruction": "q", "input": "ctx", "output": "a"}, " | ")
+        sample = {"q": "Question", "ctx": "Context", "a": "Answer"}
+        original = copy.deepcopy(sample)
+        self.assertEqual(formatter(sample), [
+            {"role": "user", "content": "Question | Context"},
+            {"role": "assistant", "content": "Answer"},
+        ])
+        self.assertEqual(sample, original)
+        for mapping in (None, {}, {"instruction": "q", "output": ""},
+                        {"instruction": "q", "output": "a", "input": 1}):
+            with self.subTest(mapping=mapping), self.assertRaises(ValueError):
+                InstructionMessages(mapping)
+        with self.assertRaises(ValueError):
+            InstructionMessages({"instruction": "q", "output": "a"}, None)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

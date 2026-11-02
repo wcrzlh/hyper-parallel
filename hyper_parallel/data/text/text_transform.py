@@ -25,7 +25,7 @@ import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.online.format import normalize_conversation
+from hyper_parallel.data.online.format import InstructionMessages, normalize_conversation
 
 TextDataType = Literal["plaintext", "conversation", "instruction"]
 logger = get_dataset_logger(__name__)
@@ -165,6 +165,7 @@ class TextConversationTransform:
     max_seq_len: int
     text_keys: str | Sequence[str] = "conversation"
     tools_key: str | None = None
+    message_formatter: Callable[[Mapping[str, Any]], list[dict[str, Any]]] | None = None
 
     def __post_init__(self) -> None:
         """Validate the chat template and sequence length configuration."""
@@ -177,7 +178,8 @@ class TextConversationTransform:
 
     def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
-        messages = normalize_conversation(_get_record_value(sample, self.text_keys))
+        messages = (self.message_formatter(sample) if self.message_formatter is not None
+                    else normalize_conversation(_get_record_value(sample, self.text_keys)))
         tools = None
         if self.tools_key is not None:
             tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)
@@ -186,72 +188,10 @@ class TextConversationTransform:
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
         """Return whether one source record contains conversation messages."""
-        messages = _get_record_value(sample, self.text_keys)
+        messages = (self.message_formatter(sample) if self.message_formatter is not None
+                    else _get_record_value(sample, self.text_keys))
         is_valid = bool(messages)
         return is_valid
-
-@dataclass
-class TextInstructionTransform:
-    """Convert column-mapped instruction records into conversation samples."""
-
-    chat_template: Any
-    max_seq_len: int
-    column_mapping: Mapping[str, str]
-    input_separator: str = "\n\n"
-
-    def __post_init__(self) -> None:
-        """Validate chat assets and logical-to-source column mappings."""
-        if self.chat_template is None:
-            raise ValueError("chat_template is required for instruction data")
-        if self.max_seq_len <= 0:
-            raise ValueError("max_seq_len must be positive")
-        if not isinstance(self.column_mapping, Mapping):
-            raise ValueError("column_mapping must be a mapping")
-        for required_key in ("instruction", "output"):
-            source_key = self.column_mapping.get(required_key)
-            if not isinstance(source_key, str) or not source_key:
-                raise ValueError(f"column_mapping must define a non-empty {required_key!r} source field")
-        input_key = self.column_mapping.get("input")
-        if input_key is not None and (not isinstance(input_key, str) or not input_key):
-            raise ValueError("column_mapping 'input' source field must be a non-empty string")
-        if not isinstance(self.input_separator, str):
-            raise ValueError("input_separator must be a string")
-
-    def _get_required_text(self, sample: Mapping[str, Any], logical_key: str) -> str:
-        """Return one required string field selected by the column mapping."""
-        source_key = self.column_mapping[logical_key]
-        try:
-            value = sample[source_key]
-        except KeyError as exc:
-            raise ValueError(f"Instruction sample does not contain field {source_key!r}") from exc
-        if not isinstance(value, str):
-            raise ValueError(f"Instruction field {source_key!r} must be a string")
-        if not value:
-            raise ValueError(f"Instruction field {source_key!r} must not be empty")
-        return value
-
-    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Convert and encode one column-mapped instruction record."""
-        instruction = self._get_required_text(sample, "instruction")
-        output = self._get_required_text(sample, "output")
-
-        input_text = ""
-        input_key = self.column_mapping.get("input")
-        if input_key is not None:
-            input_text = sample.get(input_key, "")
-            if not isinstance(input_text, str):
-                raise ValueError(f"Instruction field {input_key!r} must be a string")
-
-        user_content = instruction
-        if input_text:
-            user_content = f"{instruction}{self.input_separator}{input_text}"
-
-        messages = [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": output},
-        ]
-        encoded = _encode_messages(self.chat_template, messages, self.max_seq_len)
-        return [encoded] if bool(encoded["labels"].ne(IGNORE_INDEX).any()) else []
 
 
 def build_text_transform(
@@ -296,11 +236,10 @@ def build_text_transform(
             raise ValueError("tools_key is only supported for conversation data")
         if column_mapping is None:
             raise ValueError("column_mapping is required for instruction data")
-        data_transform = TextInstructionTransform(
+        data_transform = TextConversationTransform(
             chat_template,
             max_seq_len,
-            column_mapping,
-            input_separator,
+            message_formatter=InstructionMessages(column_mapping, input_separator),
         )
     else:
         raise ValueError(f"Unsupported text data type: {data_type!r}")

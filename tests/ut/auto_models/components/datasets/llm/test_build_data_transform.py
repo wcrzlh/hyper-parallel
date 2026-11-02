@@ -23,7 +23,6 @@ import torch
 
 from hyper_parallel.data.text.text_transform import (
     TextConversationTransform,
-    TextInstructionTransform,
     build_text_transform,
 )
 
@@ -190,14 +189,15 @@ class TestTextConversationTransform(unittest.TestCase):
                 self.assertEqual(chat_template.messages, messages)
 
 
-class TestTextInstructionTransform(unittest.TestCase):
+class TestInstructionDataTransform(unittest.TestCase):
     """Test column-mapped instruction conversion and encoding."""
 
     def test_instruction_matches_equivalent_conversation(self):
         """Produce identical tensors for instruction and canonical conversation inputs."""
         instruction_template = _RecordingChatTemplate()
-        instruction_transform = TextInstructionTransform(
-            instruction_template,
+        instruction_transform = build_text_transform(
+            "instruction",
+            chat_template=instruction_template,
             max_seq_len=32,
             column_mapping={
                 "instruction": "prompt",
@@ -205,6 +205,9 @@ class TestTextInstructionTransform(unittest.TestCase):
                 "output": "answer",
             },
         )
+        self.assertIs(type(instruction_transform), TextConversationTransform)
+        self.assertTrue(instruction_transform.is_valid_sample(
+            {"prompt": "Explain TP", "context": "Use two ranks", "answer": "Shard matrices."}))
         conversation_template = _RecordingChatTemplate()
         conversation_transform = TextConversationTransform(
             conversation_template,
@@ -235,8 +238,9 @@ class TestTextInstructionTransform(unittest.TestCase):
         ):
             with self.subTest(sample=sample):
                 chat_template = _RecordingChatTemplate()
-                transform = TextInstructionTransform(
-                    chat_template,
+                transform = build_text_transform(
+                    "instruction",
+                    chat_template=chat_template,
                     max_seq_len=32,
                     column_mapping={
                         "instruction": "instruction",
@@ -258,8 +262,9 @@ class TestTextInstructionTransform(unittest.TestCase):
                 max_seq_len=32,
             )
 
-        transform = TextInstructionTransform(
-            _RecordingChatTemplate(),
+        transform = build_text_transform(
+            "instruction",
+            chat_template=_RecordingChatTemplate(),
             max_seq_len=32,
             column_mapping={"instruction": "instruction", "input": "input", "output": "output"},
         )

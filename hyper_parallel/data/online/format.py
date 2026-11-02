@@ -15,14 +15,16 @@
 """Shared fixed-format conversion for messages, ShareGPT, and interleaved media.
 
 Each converter accepts an explicit source contract. They do not infer arbitrary
-source schemas or select training supervision. Model transforms own dataset
-fields, chat templates, media encoding, labels, and training constraints.
+source schemas or select training supervision. Explicit format converters own
+message field mapping. Model transforms own chat templates, media encoding,
+labels, and training constraints.
 """
 
 import copy
 import os
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from hyper_parallel.data.constants import ONLINE_SOURCE_PATH_KEY
@@ -385,3 +387,60 @@ def convert_interleaved_to_content(sample: Mapping[str, Any]) -> list[dict[str, 
                 image_reference = resolve_media_path(image, source_directory)
             content.append({"type": "image", "url": image_reference})
     return content
+
+
+@dataclass
+class InstructionMessages:
+    """Convert explicitly mapped instruction fields into standard messages."""
+
+    column_mapping: Mapping[str, str]
+    input_separator: str = "\n\n"
+
+    def __post_init__(self) -> None:
+        """Validate logical-to-source column mappings and the input separator."""
+        if not isinstance(self.column_mapping, Mapping):
+            raise ValueError("column_mapping must be a mapping")
+        for required_key in ("instruction", "output"):
+            source_key = self.column_mapping.get(required_key)
+            if not isinstance(source_key, str) or not source_key:
+                raise ValueError(f"column_mapping must define a non-empty {required_key!r} source field")
+        input_key = self.column_mapping.get("input")
+        if input_key is not None and (not isinstance(input_key, str) or not input_key):
+            raise ValueError("column_mapping 'input' source field must be a non-empty string")
+        if not isinstance(self.input_separator, str):
+            raise ValueError("input_separator must be a string")
+
+    def _get_required_text(self, sample: Mapping[str, Any], logical_key: str) -> str:
+        """Return one required string field selected by the column mapping."""
+        source_key = self.column_mapping[logical_key]
+        try:
+            value = sample[source_key]
+        except KeyError as exc:
+            raise ValueError(f"Instruction sample does not contain field {source_key!r}") from exc
+        if not isinstance(value, str):
+            raise ValueError(f"Instruction field {source_key!r} must be a string")
+        if not value:
+            raise ValueError(f"Instruction field {source_key!r} must not be empty")
+        return value
+
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Read instruction fields and return user/assistant messages."""
+        instruction = self._get_required_text(sample, "instruction")
+        output = self._get_required_text(sample, "output")
+
+        input_text = ""
+        input_key = self.column_mapping.get("input")
+        if input_key is not None:
+            input_text = sample.get(input_key, "")
+            if not isinstance(input_text, str):
+                raise ValueError(f"Instruction field {input_key!r} must be a string")
+
+        user_content = instruction
+        if input_text:
+            user_content = f"{instruction}{self.input_separator}{input_text}"
+
+        messages = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": output},
+        ]
+        return messages
