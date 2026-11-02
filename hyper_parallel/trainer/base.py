@@ -450,6 +450,7 @@ class BaseTrainer(Stateful, ABC):
             tokenizer=self.tokenizer,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            sampler_type=self.config.dataloader.sampler_type,
         )
 
         if isinstance(dataset_result, tuple) and len(dataset_result) == 3:

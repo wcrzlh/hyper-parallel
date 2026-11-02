@@ -25,20 +25,10 @@ import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.online.format import normalize_conversation
 
 TextDataType = Literal["plaintext", "conversation", "instruction"]
 logger = get_dataset_logger(__name__)
-
-_SHAREGPT_ROLE_MAP = {
-    "system": "system",
-    "human": "user",
-    "user": "user",
-    "gpt": "assistant",
-    "assistant": "assistant",
-    "chatgpt": "assistant",
-    "model": "assistant",
-    "bot": "assistant",
-}
 
 
 def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> Any:
@@ -51,45 +41,6 @@ def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> A
         if key in sample:
             return sample[key]
     raise ValueError(f"Sample does not contain any configured text fields: {list(keys)!r}")
-
-
-def _normalize_conversation(messages: Any) -> list[dict[str, Any]]:
-    """Normalize OpenAI and ShareGPT messages to role/content records."""
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
-        raise ValueError("Conversation messages must be a sequence of mappings")
-
-    normalized_messages = []
-    for message in messages:
-        if not isinstance(message, Mapping):
-            raise ValueError("Every conversation message must be a mapping")
-
-        if "role" in message:
-            tool_only_assistant = message["role"] == "assistant" and bool(message.get("tool_calls"))
-            if "content" not in message and not tool_only_assistant:
-                raise ValueError("A role/content message must contain field 'content'")
-            normalized_message = dict(message)
-            if tool_only_assistant:
-                normalized_message.setdefault("content", "")
-        elif "from" in message:
-            if "value" not in message:
-                raise ValueError("A ShareGPT from/value message must contain field 'value'")
-            source_role = message["from"]
-            try:
-                role = _SHAREGPT_ROLE_MAP[source_role]
-            except (KeyError, TypeError) as exc:
-                raise ValueError(f"Unsupported ShareGPT role: {source_role!r}") from exc
-            normalized_message = {
-                "role": role,
-                "content": message["value"],
-            }
-            if "loss_mask" in message:
-                normalized_message["loss_mask"] = message["loss_mask"]
-        else:
-            raise ValueError("A conversation message must use role/content or from/value fields")
-
-        normalized_messages.append(normalized_message)
-
-    return normalized_messages
 
 
 def _normalize_tools(tools: Any, tools_key: str) -> list[dict[str, Any]] | None:
@@ -226,7 +177,7 @@ class TextConversationTransform:
 
     def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
-        messages = _normalize_conversation(_get_record_value(sample, self.text_keys))
+        messages = normalize_conversation(_get_record_value(sample, self.text_keys))
         tools = None
         if self.tools_key is not None:
             tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)

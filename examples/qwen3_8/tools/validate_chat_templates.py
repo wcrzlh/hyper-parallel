@@ -40,9 +40,9 @@ import yaml
 
 import hyper_parallel
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.data.online.format import normalize_conversation
 from hyper_parallel.data.text.text_transform import (
     TextConversationTransform,
-    _normalize_conversation,
     _normalize_tools,
 )
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
@@ -67,7 +67,7 @@ def validate_record(line: str, line_number: int, transform: TextConversationTran
             raise ValueError("Each JSONL record must be an object")
         result["stage"] = "normalize"
         # Reuse training normalization so tool JSON strings and ShareGPT roles behave identically.
-        messages = _normalize_conversation(record[transform.text_keys])
+        messages = normalize_conversation(record[transform.text_keys])
         tools = None
         if transform.tools_key is not None:
             tools = _normalize_tools(record.get(transform.tools_key), transform.tools_key)

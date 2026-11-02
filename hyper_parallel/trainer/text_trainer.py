@@ -100,10 +100,10 @@ class TextTrainer:
                     assets_config.chat_template,
                     self.base.tokenizer,
                     chat_template_kwargs=assets_config.chat_template_kwargs,
-                    log_first_rendered_template=assets_config.log_first_chat_template,
+                    log_first_rendered_template=config.debug.log_first_rendered_template,
                 )
             else:
-                if assets_config.chat_template_kwargs or assets_config.log_first_chat_template:
+                if assets_config.chat_template_kwargs or config.debug.log_first_rendered_template:
                     raise ValueError(
                         "dataset.model_assets chat-template options require chat_template='tokenizer'"
                     )

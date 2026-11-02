@@ -22,10 +22,73 @@ fields, chat templates, media encoding, labels, and training constraints.
 import copy
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.data.constants import ONLINE_SOURCE_PATH_KEY
+
+
+_SHAREGPT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "chatgpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
+}
+
+
+def normalize_conversation(messages: Any) -> list[dict[str, Any]]:
+    """Normalize message fields without rendering templates or selecting supervision.
+
+    Args:
+        messages: OpenAI role/content or ShareGPT from/value message sequence.
+
+    Returns:
+        New message dictionaries with normalized roles and content. OpenAI
+        extension fields and ShareGPT loss_mask are preserved. Media content
+        is left untouched; callers own media expansion and encoding.
+
+    Raises:
+        ValueError: If message containers, required fields or ShareGPT roles are invalid.
+    """
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        raise ValueError("Conversation messages must be a sequence of mappings")
+
+    normalized_messages = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError("Every conversation message must be a mapping")
+
+        if "role" in message:
+            tool_only_assistant = message["role"] == "assistant" and bool(message.get("tool_calls"))
+            if "content" not in message and not tool_only_assistant:
+                raise ValueError("A role/content message must contain field 'content'")
+            normalized_message = dict(message)
+            if tool_only_assistant:
+                normalized_message.setdefault("content", "")
+        elif "from" in message:
+            if "value" not in message:
+                raise ValueError("A ShareGPT from/value message must contain field 'value'")
+            source_role = message["from"]
+            try:
+                role = _SHAREGPT_ROLE_MAP[source_role]
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"Unsupported ShareGPT role: {source_role!r}") from exc
+            normalized_message = {
+                "role": role,
+                "content": message["value"],
+            }
+            if "loss_mask" in message:
+                normalized_message["loss_mask"] = message["loss_mask"]
+        else:
+            raise ValueError("A conversation message must use role/content or from/value fields")
+
+        normalized_messages.append(normalized_message)
+
+    return normalized_messages
 
 
 def resolve_media_path(media_path: str, source_directory: str) -> str:
@@ -239,19 +302,17 @@ def convert_sharegpt_to_messages(sample: Mapping[str, Any]) -> list[dict[str, An
         raise ValueError("ShareGPT requires nonempty conversations with from/value")
 
     media = _read_sharegpt_media(sample)
-    roles = {"human": "user", "gpt": "assistant", "system": "system"}
     consumed = {"image": 0, "video": 0}
     messages = []
     for turn in conversations:
         if not isinstance(turn, dict) or not isinstance(turn.get("from"), str):
             raise ValueError("ShareGPT conversations require mapping turns with a from role")
-
-        role = roles.get(turn["from"])
-        if role is None or not isinstance(turn.get("value"), str):
+        if turn["from"] not in ("human", "gpt", "system") or not isinstance(turn.get("value"), str):
             raise ValueError("ShareGPT requires human/gpt/system roles and string values")
 
+    for message in normalize_conversation(conversations):
         content = []
-        for part in re.split(r"(<image>|<video>)", turn["value"]):
+        for part in re.split(r"(<image>|<video>)", message["content"]):
             if part in ("<image>", "<video>"):
                 media_type = part[1:-1]
                 index = consumed[media_type]
@@ -262,8 +323,9 @@ def convert_sharegpt_to_messages(sample: Mapping[str, Any]) -> list[dict[str, An
                 consumed[media_type] += 1
             elif part:
                 content.append({"type": "text", "text": part})
-        message_content = content if any(block["type"] != "text" for block in content) else turn["value"]
-        messages.append({"role": role, "content": message_content})
+        if any(block["type"] != "text" for block in content):
+            message["content"] = content
+        messages.append(message)
     for media_type, references in media.items():
         if consumed[media_type] != len(references):
             raise ValueError(f"ShareGPT has unused {media_type} references without matching placeholders")

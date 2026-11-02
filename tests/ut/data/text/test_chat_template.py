@@ -31,7 +31,8 @@ from typing import Any
 
 from hyper_parallel.data.dataset_logging import DatasetLogger
 from hyper_parallel.data.text import chat_template
-from hyper_parallel.data.text.text_transform import TextConversationTransform, _normalize_conversation
+from hyper_parallel.data.online.format import normalize_conversation
+from hyper_parallel.data.text.text_transform import TextConversationTransform
 
 from tests.common.mark_utils import arg_mark
 from tests.ut.data.conftest import (
@@ -407,7 +408,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
                                         {"role": tool_role, "content": "Second result"},
                                         {"role": "assistant", "content": "Done", "reasoning_content": "Check"}]
                             original = json.dumps(messages)
-                            normalized = _normalize_conversation(messages)
+                            normalized = normalize_conversation(messages)
                             self.assertEqual(json.dumps(messages), original)
                             tokenizer = ToolOnlyThinkingTokenizer()
                             template = chat_template.build_chat_template("tokenizer", tokenizer)
@@ -468,7 +469,7 @@ class TestChatTemplateGoldens(unittest.TestCase):
         for message in ({"role": "assistant"}, {"role": "user", "tool_calls": [{"function": {}}]},
                         {"role": "assistant", "tool_calls": []}):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, "content"):
-                _normalize_conversation([message])
+                normalize_conversation([message])
 
     def test_tokenizer_multiturn_preserve_thinking_controls_history_stability(self) -> None:
         """Preserve supervised history when enabled; continue rejecting rewrites otherwise."""
