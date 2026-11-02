@@ -15,22 +15,15 @@
 """Unit tests for Hugging Face checkpoint export sources."""
 
 import unittest
-from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import torch
 from transformers import PretrainedConfig, PreTrainedModel
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.distributed_checkpoint import (
-    BytesStorageMetadata,
-    Metadata,
-    StandardSavePlanner,
-    TensorProperties,
-    TensorStorageMetadata,
-    save,
-)
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.core.fully_shard.api import _extend_module_with_hsdp_interface
 
@@ -60,8 +53,14 @@ class ExportableModel(PreTrainedModel):
 class TestCheckpointManagerSave(unittest.TestCase):
     """Verify DCP-backed export does not read live training parameters."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_hsdp_export_uses_original_class_without_mutating_training_model(self) -> None:
-        """Description: Save a wrapped model. Expectation: only the export view is unwrapped."""
+        """Feature: HF checkpoint export.
+
+        Description: Save a wrapped model.
+        Expectation: only the export view is unwrapped.
+        """
         model = ExportableModel("qwen3_5_text")
         _extend_module_with_hsdp_interface(model)
         training_class, training_config, weight = type(model), model.config, model.weight
@@ -75,8 +74,14 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertEqual(model.config.architectures, ["ExportableModel"])
         self.assertIsNot(model.exports[0][1], model.config)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_export_failure_preserves_live_class_config_and_conversions(self) -> None:
-        """Description: HF writing fails. Expectation: no training metadata changes."""
+        """Feature: HF checkpoint export.
+
+        Description: HF writing fails.
+        Expectation: no training metadata changes.
+        """
         model = ExportableModel("qwen3_5_text")
         _extend_module_with_hsdp_interface(model)
         model.fail_export = True
@@ -92,8 +97,14 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertIs(model._weight_conversions, conversions)
         self.assertEqual(model.config.architectures, ["ExportableModel"])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_qwen_text_keeps_native_namespace_and_fused_experts(self) -> None:
-        """Description: Export dense/MoE text. Expectation: do not undo source VLM prefix removal."""
+        """Feature: HF checkpoint export.
+
+        Description: Export dense/MoE text.
+        Expectation: do not undo source VLM prefix removal.
+        """
         for model_type in ("qwen3_5_text", "qwen3_5_moe_text"):
             with self.subTest(model_type=model_type):
                 model = ExportableModel(model_type)
@@ -102,8 +113,14 @@ class TestCheckpointManagerSave(unittest.TestCase):
                 self.assertFalse(model.exports[0][2]["save_original_format"])
                 torch.testing.assert_close(model.exports[0][2]["state_dict"]["weight"], model.weight)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_qwen_text_still_reverses_replacement_layout(self) -> None:
-        """Description: Grouped experts plus prefix history. Expectation: reverse only replacement layout."""
+        """Feature: HF checkpoint export.
+
+        Description: Grouped experts plus prefix history.
+        Expectation: reverse only replacement layout.
+        """
         model = ExportableModel("qwen3_5_moe_text")
         replacements, base = [object()], [object()]
         model._hp_used_replacement_weight_conversions = replacements
@@ -115,7 +132,7 @@ class TestCheckpointManagerSave(unittest.TestCase):
             self.assertIs(export_model._weight_conversions, replacements)
             return {"weight": state["weight"] + 1}
 
-        with patch("hyper_parallel.models._transformers.checkpoint_loader.revert_weight_conversion",
+        with patch("hyper_parallel.models.qwen3_5.adapter.checkpoint.revert_weight_conversion",
                    side_effect=reverse_layout) as reverse:
             CheckpointManager(model).save_pretrained("/unused")
 
@@ -124,8 +141,14 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertFalse(model.exports[0][2]["save_original_format"])
         torch.testing.assert_close(model.exports[0][2]["state_dict"]["weight"], model.weight + 1)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_vlm_and_other_models_keep_original_format_policy(self) -> None:
-        """Description: Non-text-Qwen export. Expectation: never globally strip language_model."""
+        """Feature: HF checkpoint export.
+
+        Description: Non-text-Qwen export.
+        Expectation: never globally strip language_model.
+        """
         for model_type in ("qwen3_5", "qwen3_5_moe", "llama"):
             with self.subTest(model_type=model_type):
                 model = ExportableModel(model_type)
@@ -135,6 +158,38 @@ class TestCheckpointManagerSave(unittest.TestCase):
                 self.assertTrue(model.exports[0][2]["save_original_format"])
                 self.assertIn("model.language_model.weight", model.exports[0][2]["state_dict"])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_unregistered_model_preserves_explicit_export_policy(self) -> None:
+        """Feature: HF checkpoint export.
+
+        Description: No adapter exists.
+        Expectation: honor the caller's format flag.
+        """
+        model = ExportableModel("unregistered_export_test")
+        CheckpointManager(model).save_pretrained("/unused", save_original_format=False)
+        self.assertFalse(model.exports[0][2]["save_original_format"])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_qwen_conversion_failure_preserves_metadata(self) -> None:
+        """Feature: HF checkpoint export.
+
+        Description: Adapter conversion fails.
+        Expectation: live metadata stays intact.
+        """
+        model = ExportableModel("qwen3_5_text")
+        original_mapping = model._weight_conversions = [object()]
+        model._hp_used_replacement_weight_conversions = [object()]
+        with patch("hyper_parallel.models.qwen3_5.adapter.checkpoint.revert_weight_conversion",
+                   side_effect=ValueError("conversion failed")):
+            with self.assertRaisesRegex(ValueError, "conversion failed"):
+                CheckpointManager(model).save_pretrained("/unused", save_original_format=False)
+        self.assertIs(model._weight_conversions, original_mapping)
+        self.assertEqual(model.exports, [])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_live_export_disables_autograd_for_parameter_gather(self) -> None:
         """Feature: Live HF export without autograd.
 
@@ -158,215 +213,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertFalse(state["weight"].requires_grad)
         self.assertIsNone(state["weight"].grad_fn)
         model.state_dict.assert_called_once_with(keep_vars=True)
-
-    @staticmethod
-    def _expert_export_model(hidden_size: int = 4, intermediate_size: int = 2) -> torch.nn.Module:
-        """Create an HF-shaped meta model without Transformers or device allocation."""
-        model = torch.nn.Module()
-        model.experts = torch.nn.Module()
-        model.experts.gate_up_proj = torch.nn.Parameter(
-            torch.empty(2, 2 * intermediate_size, hidden_size, device="meta")
-        )
-        model.experts.down_proj = torch.nn.Parameter(
-            torch.empty(2, hidden_size, intermediate_size, device="meta")
-        )
-        return model
-
-    def test_dcp_grouped_experts_restore_values_including_square_projection(self) -> None:
-        """One non-square projection identifies the layout of the square projection too."""
-        model = self._expert_export_model()
-        original = {
-            name: torch.arange(tensor.numel()).reshape(tensor.shape)
-            for name, tensor in model.state_dict().items()
-        }
-        training = {name: tensor.transpose(-2, -1).contiguous() for name, tensor in original.items()}
-        manager = CheckpointManager(model)
-
-        restored = manager._normalize_dcp_export_layout(training, "auto")  # pylint: disable=W0212
-
-        for name, tensor in original.items():
-            torch.testing.assert_close(restored[name], tensor)
-            torch.testing.assert_close(training[name], tensor.transpose(-2, -1))
-
-    def test_dcp_hf_layout_is_preserved(self) -> None:
-        """Native HF experts must not be transposed a second time."""
-        model = self._expert_export_model()
-        original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
-
-        restored = CheckpointManager(model)._normalize_dcp_export_layout(  # pylint: disable=W0212
-            original, "auto"
-        )
-
-        for name, tensor in original.items():
-            self.assertIs(restored[name], tensor)
-
-    def test_dcp_wrong_model_config_is_rejected(self) -> None:
-        """An expert-count mismatch cannot be repaired by transposition."""
-        model = self._expert_export_model()
-        wrong = {name: torch.empty(3, *tensor.shape[1:]) for name, tensor in model.state_dict().items()}
-
-        with self.assertRaisesRegex(ValueError, "expert shapes"):
-            CheckpointManager(model)._normalize_dcp_export_layout(wrong, "auto")  # pylint: disable=W0212
-
-    def test_dcp_missing_parameters_are_rejected(self) -> None:
-        """Feature: Complete offline HF export.
-
-        Description: Supply a shape-correct checkpoint missing one model parameter.
-        Expectation: Reject instead of producing a checkpoint that reloads random weights.
-        """
-        model = torch.nn.Linear(4, 2, device="meta")
-        with self.assertRaisesRegex(ValueError, "missing.*bias"):
-            CheckpointManager(model)._normalize_dcp_export_layout(
-                {"weight": torch.empty(2, 4)}, "auto",
-            )
-
-    def test_dcp_dense_shape_mismatch_is_rejected(self) -> None:
-        """Configuration validation also covers non-expert parameters."""
-        model = torch.nn.Linear(4, 2, bias=False, device="meta")
-
-        with self.assertRaisesRegex(ValueError, "weight.*HF expects"):
-            CheckpointManager(model)._normalize_dcp_export_layout(  # pylint: disable=W0212
-                {"weight": torch.empty(4, 2)}, "auto"
-            )
-
-    @patch.object(CheckpointManager, "_is_main_process", return_value=True)
-    def test_offline_save_passes_restored_experts_to_hf(self, unused_is_main: MagicMock) -> None:
-        """Read a real DCP snapshot and pass restored expert values to HF saving."""
-        del unused_is_main
-        model = self._expert_export_model()
-        model.save_pretrained = MagicMock()
-        original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
-        training = {name: tensor.transpose(-2, -1).contiguous() for name, tensor in original.items()}
-
-        with (
-            TemporaryDirectory() as checkpoint_dir,
-            patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0),
-            patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1),
-            patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier"),
-        ):
-            save(
-                {"model": training},
-                checkpoint_id=checkpoint_dir,
-                planner=StandardSavePlanner(enable_plan_caching=False),
-            )
-            CheckpointManager(model).save_pretrained(
-                "/tmp/hf", dcp_checkpoint=checkpoint_dir, dcp_expert_layout="auto"
-            )
-
-        saved = model.save_pretrained.call_args.kwargs["state_dict"]
-        for name, tensor in original.items():
-            torch.testing.assert_close(saved[name], tensor)
-
-    def test_ambiguous_experts_require_explicit_layout(self) -> None:
-        """Square weights require the caller to specify their orientation."""
-        model = torch.nn.Module()
-        model.experts = torch.nn.Module()
-        model.experts.down_proj = torch.nn.Parameter(torch.empty(2, 3, 3, device="meta"))
-        weight = torch.arange(18).reshape(2, 3, 3)
-        manager = CheckpointManager(model)
-        state_dict = {"experts.down_proj": weight}
-
-        with self.assertRaisesRegex(ValueError, "Ambiguous expert layout"):
-            manager._normalize_dcp_export_layout(state_dict, "auto")  # pylint: disable=W0212
-        restored = manager._normalize_dcp_export_layout(state_dict, "grouped_gemm")  # pylint: disable=W0212
-        torch.testing.assert_close(restored["experts.down_proj"], weight.transpose(-2, -1))
-        restored = manager._normalize_dcp_export_layout(state_dict, "hf")  # pylint: disable=W0212
-        self.assertIs(restored["experts.down_proj"], weight)
-
-    @patch.object(CheckpointManager, "_is_main_process", return_value=True)
-    @patch.object(CheckpointManager, "_load_model_state_dict_from_dcp")
-    def test_save_pretrained_uses_dcp_on_main_rank(
-        self,
-        load_dcp_state: MagicMock,
-        unused_is_main_process: MagicMock,
-    ) -> None:
-        """Rank 0 should export the persisted snapshot instead of the live model."""
-        del unused_is_main_process
-        state_dict = {"model.weight": torch.ones(2)}
-        load_dcp_state.return_value = state_dict
-        model = MagicMock()
-        model._hp_used_base_weight_conversions = None
-        model._hp_used_replacement_weight_conversions = None
-        manager = CheckpointManager(model)
-
-        wrote_checkpoint = manager.save_pretrained(
-            "/tmp/hf",
-            dcp_checkpoint="/tmp/dcp",
-        )
-
-        self.assertTrue(wrote_checkpoint)
-        load_dcp_state.assert_called_once_with("/tmp/dcp")
-        model.state_dict.assert_not_called()
-        model.save_pretrained.assert_called_once_with(
-            "/tmp/hf",
-            state_dict=state_dict,
-            is_main_process=True,
-            max_shard_size="5GB",
-            save_original_format=True,
-        )
-
-    @patch.object(CheckpointManager, "_is_main_process", return_value=False)
-    def test_non_main_rank_does_not_read_dcp(
-        self,
-        unused_is_main_process: MagicMock,
-    ) -> None:
-        """Non-writing ranks should wait in the callback without loading shards."""
-        del unused_is_main_process
-        model = MagicMock()
-        manager = CheckpointManager(model)
-        manager._load_model_state_dict_from_dcp = MagicMock()  # pylint: disable=W0212
-
-        wrote_checkpoint = manager.save_pretrained(
-            "/tmp/hf",
-            dcp_checkpoint="/tmp/dcp",
-        )
-
-        self.assertFalse(wrote_checkpoint)
-        manager._load_model_state_dict_from_dcp.assert_not_called()  # pylint: disable=W0212
-        model.save_pretrained.assert_not_called()
-
-    @patch("hyper_parallel.models._transformers.checkpoint_loader.load_dcp_state")
-    @patch("hyper_parallel.models._transformers.checkpoint_loader.FileSystemReader")
-    def test_dcp_export_loads_only_model_tensors(
-        self,
-        file_system_reader: MagicMock,
-        load_dcp_state: MagicMock,
-    ) -> None:
-        """Optimizer and extra state must not be materialized during HF export."""
-        tensor_metadata = TensorStorageMetadata(
-            properties=TensorProperties(dtype="torch.float32"),
-            size=(2,),
-        )
-        file_system_reader.return_value.load_metadata.return_value = Metadata(
-            state_dict_metadata={
-                "model.model.weight": tensor_metadata,
-                "optimizer.state.weight.exp_avg": tensor_metadata,
-                "extra_state": BytesStorageMetadata(),
-            },
-            planner_data={
-                "model.model.weight": ("model", "model.weight"),
-                "optimizer.state.weight.exp_avg": (
-                    "optimizer",
-                    "state",
-                    "weight",
-                    "exp_avg",
-                ),
-                "extra_state": ("extra_state",),
-            },
-        )
-        manager = CheckpointManager(MagicMock())
-
-        state_dict = manager._load_model_state_dict_from_dcp("/tmp/dcp")  # pylint: disable=W0212
-
-        self.assertEqual(tuple(state_dict), ("model.weight",))
-        loaded_state = load_dcp_state.call_args.args[0]
-        self.assertEqual(tuple(loaded_state), ("model.model.weight",))
-        load_dcp_state.assert_called_once_with(
-            loaded_state,
-            checkpoint_id="/tmp/dcp",
-            no_dist=True,
-            broadcast_replicated_tensors=False,
-        )
 
 
 if __name__ == "__main__":

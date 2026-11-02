@@ -1,0 +1,253 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Offline DCP-to-HF conversion tests for the standalone tool."""
+
+import importlib.util
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from hyper_parallel.core.distributed_checkpoint import (
+    BytesStorageMetadata,
+    Metadata,
+    StandardSavePlanner,
+    TensorProperties,
+    TensorStorageMetadata,
+    save,
+)
+
+# Load the standalone CLI by path so an unrelated installed examples package
+# cannot shadow the repository tool during CI collection.
+_TOOL_PATH = Path(__file__).resolve().parents[3] / "examples/qwen3_8/tools/convert_dcp_to_hf.py"
+_SPEC = importlib.util.spec_from_file_location("qwen_dcp_to_hf_tool", _TOOL_PATH)
+_TOOL = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_TOOL)
+DCPCheckpointManager = _TOOL.DCPCheckpointManager
+
+
+class TestDCPCheckpointManager(unittest.TestCase):
+    """Exercise offline reconstruction without changing online checkpointing."""
+
+    @staticmethod
+    def _expert_export_model(hidden_size: int = 4, intermediate_size: int = 2) -> torch.nn.Module:
+        """Create an HF-shaped meta model without Transformers or device allocation."""
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        model.experts.gate_up_proj = torch.nn.Parameter(
+            torch.empty(2, 2 * intermediate_size, hidden_size, device="meta")
+        )
+        model.experts.down_proj = torch.nn.Parameter(
+            torch.empty(2, hidden_size, intermediate_size, device="meta")
+        )
+        return model
+
+    def test_dcp_grouped_experts_restore_values_including_square_projection(self) -> None:
+        """One non-square projection identifies the layout of the square projection too."""
+        model = self._expert_export_model()
+        original = {
+            name: torch.arange(tensor.numel()).reshape(tensor.shape)
+            for name, tensor in model.state_dict().items()
+        }
+        training = {name: tensor.transpose(-2, -1).contiguous() for name, tensor in original.items()}
+        manager = DCPCheckpointManager(model)
+
+        restored = manager._normalize_dcp_export_layout(training, "auto")  # pylint: disable=W0212
+
+        for name, tensor in original.items():
+            torch.testing.assert_close(restored[name], tensor)
+            torch.testing.assert_close(training[name], tensor.transpose(-2, -1))
+
+    def test_dcp_hf_layout_is_preserved(self) -> None:
+        """Native HF experts must not be transposed a second time."""
+        model = self._expert_export_model()
+        original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
+
+        restored = DCPCheckpointManager(model)._normalize_dcp_export_layout(  # pylint: disable=W0212
+            original, "auto"
+        )
+
+        for name, tensor in original.items():
+            self.assertIs(restored[name], tensor)
+
+    def test_dcp_wrong_model_config_is_rejected(self) -> None:
+        """An expert-count mismatch cannot be repaired by transposition."""
+        model = self._expert_export_model()
+        wrong = {name: torch.empty(3, *tensor.shape[1:]) for name, tensor in model.state_dict().items()}
+
+        with self.assertRaisesRegex(ValueError, "expert shapes"):
+            DCPCheckpointManager(model)._normalize_dcp_export_layout(wrong, "auto")  # pylint: disable=W0212
+
+    def test_dcp_missing_parameters_are_rejected(self) -> None:
+        """Feature: Complete offline HF export.
+
+        Description: Supply a shape-correct checkpoint missing one model parameter.
+        Expectation: Reject instead of producing a checkpoint that reloads random weights.
+        """
+        model = torch.nn.Linear(4, 2, device="meta")
+        with self.assertRaisesRegex(ValueError, "missing.*bias"):
+            DCPCheckpointManager(model)._normalize_dcp_export_layout(
+                {"weight": torch.empty(2, 4)}, "auto",
+            )
+
+    def test_dcp_dense_shape_mismatch_is_rejected(self) -> None:
+        """Configuration validation also covers non-expert parameters."""
+        model = torch.nn.Linear(4, 2, bias=False, device="meta")
+
+        with self.assertRaisesRegex(ValueError, "weight.*HF expects"):
+            DCPCheckpointManager(model)._normalize_dcp_export_layout(  # pylint: disable=W0212
+                {"weight": torch.empty(4, 2)}, "auto"
+            )
+
+    @patch.object(DCPCheckpointManager, "_is_main_process", return_value=True)
+    def test_offline_save_passes_restored_experts_to_hf(self, unused_is_main: MagicMock) -> None:
+        """Read a real DCP snapshot and pass restored expert values to HF saving."""
+        del unused_is_main
+        model = self._expert_export_model()
+        model.save_pretrained = MagicMock()
+        original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
+        training = {name: tensor.transpose(-2, -1).contiguous() for name, tensor in original.items()}
+
+        with (
+            TemporaryDirectory() as checkpoint_dir,
+            patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0),
+            patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1),
+            patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier"),
+        ):
+            save(
+                {"model": training},
+                checkpoint_id=checkpoint_dir,
+                planner=StandardSavePlanner(enable_plan_caching=False),
+            )
+            DCPCheckpointManager(model).save_pretrained(
+                "/tmp/hf", dcp_checkpoint=checkpoint_dir, dcp_expert_layout="auto"
+            )
+
+        saved = model.save_pretrained.call_args.kwargs["state_dict"]
+        for name, tensor in original.items():
+            torch.testing.assert_close(saved[name], tensor)
+
+    def test_ambiguous_experts_require_explicit_layout(self) -> None:
+        """Square weights require the caller to specify their orientation."""
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        model.experts.down_proj = torch.nn.Parameter(torch.empty(2, 3, 3, device="meta"))
+        weight = torch.arange(18).reshape(2, 3, 3)
+        manager = DCPCheckpointManager(model)
+        state_dict = {"experts.down_proj": weight}
+
+        with self.assertRaisesRegex(ValueError, "Ambiguous expert layout"):
+            manager._normalize_dcp_export_layout(state_dict, "auto")  # pylint: disable=W0212
+        restored = manager._normalize_dcp_export_layout(state_dict, "grouped_gemm")  # pylint: disable=W0212
+        torch.testing.assert_close(restored["experts.down_proj"], weight.transpose(-2, -1))
+        restored = manager._normalize_dcp_export_layout(state_dict, "hf")  # pylint: disable=W0212
+        self.assertIs(restored["experts.down_proj"], weight)
+
+    @patch.object(DCPCheckpointManager, "_is_main_process", return_value=True)
+    @patch.object(DCPCheckpointManager, "_load_model_state_dict_from_dcp")
+    def test_save_pretrained_uses_dcp_on_main_rank(
+        self,
+        load_dcp_state: MagicMock,
+        unused_is_main_process: MagicMock,
+    ) -> None:
+        """Rank 0 should export the persisted snapshot instead of the live model."""
+        del unused_is_main_process
+        state_dict = {"model.weight": torch.ones(2)}
+        load_dcp_state.return_value = state_dict
+        model = MagicMock()
+        model._hp_used_base_weight_conversions = None
+        model._hp_used_replacement_weight_conversions = None
+        manager = DCPCheckpointManager(model)
+
+        wrote_checkpoint = manager.save_pretrained(
+            "/tmp/hf",
+            dcp_checkpoint="/tmp/dcp",
+        )
+
+        self.assertTrue(wrote_checkpoint)
+        load_dcp_state.assert_called_once_with("/tmp/dcp")
+        model.state_dict.assert_not_called()
+        model.save_pretrained.assert_called_once_with(
+            "/tmp/hf",
+            state_dict=state_dict,
+            is_main_process=True,
+            max_shard_size="5GB",
+            save_original_format=True,
+        )
+
+    @patch.object(DCPCheckpointManager, "_is_main_process", return_value=False)
+    def test_non_main_rank_does_not_read_dcp(
+        self,
+        unused_is_main_process: MagicMock,
+    ) -> None:
+        """Non-writing ranks must not read shards or gather live weights."""
+        del unused_is_main_process
+        model = MagicMock()
+        manager = DCPCheckpointManager(model)
+        manager._load_model_state_dict_from_dcp = MagicMock()  # pylint: disable=W0212
+
+        wrote_checkpoint = manager.save_pretrained(
+            "/tmp/hf",
+            dcp_checkpoint="/tmp/dcp",
+        )
+
+        self.assertFalse(wrote_checkpoint)
+        manager._load_model_state_dict_from_dcp.assert_not_called()  # pylint: disable=W0212
+        model.save_pretrained.assert_not_called()
+
+    @patch.object(_TOOL, "load_dcp_state")
+    @patch.object(_TOOL, "FileSystemReader")
+    def test_dcp_export_loads_only_model_tensors(
+        self,
+        file_system_reader: MagicMock,
+        load_dcp_state: MagicMock,
+    ) -> None:
+        """Optimizer and extra state must not be materialized during HF export."""
+        tensor_metadata = TensorStorageMetadata(
+            properties=TensorProperties(dtype="torch.float32"),
+            size=(2,),
+        )
+        file_system_reader.return_value.load_metadata.return_value = Metadata(
+            state_dict_metadata={
+                "model.model.weight": tensor_metadata,
+                "optimizer.state.weight.exp_avg": tensor_metadata,
+                "extra_state": BytesStorageMetadata(),
+            },
+            planner_data={
+                "model.model.weight": ("model", "model.weight"),
+                "optimizer.state.weight.exp_avg": (
+                    "optimizer",
+                    "state",
+                    "weight",
+                    "exp_avg",
+                ),
+                "extra_state": ("extra_state",),
+            },
+        )
+        manager = DCPCheckpointManager(MagicMock())
+
+        state_dict = manager._load_model_state_dict_from_dcp("/tmp/dcp")  # pylint: disable=W0212
+
+        self.assertEqual(tuple(state_dict), ("model.weight",))
+        loaded_state = load_dcp_state.call_args.args[0]
+        self.assertEqual(tuple(loaded_state), ("model.model.weight",))
+        load_dcp_state.assert_called_once_with(
+            loaded_state,
+            checkpoint_id="/tmp/dcp",
+            no_dist=True,
+            broadcast_replicated_tensors=False,
+        )

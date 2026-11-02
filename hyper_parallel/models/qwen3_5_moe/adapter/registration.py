@@ -15,6 +15,7 @@
 """Architecture and sharding contracts for Qwen3.5-MoE and Qwen3.6."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5.adapter.checkpoint import export_text_checkpoint
 from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
 from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp_execution_order
 from hyper_parallel.models.registry import register_model_adapter
@@ -66,6 +67,7 @@ QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
 )
 
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
+    checkpoint_export=export_text_checkpoint,
     materialization=register_rotary_materialization,
     architecture="Qwen3_5MoeForCausalLM",
     model_type="qwen3_5_moe_text",

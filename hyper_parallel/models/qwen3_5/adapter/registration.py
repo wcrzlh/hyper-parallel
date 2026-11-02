@@ -15,6 +15,7 @@
 """Architecture identity and GDN sharding rules for Qwen3.5."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5.adapter.checkpoint import export_text_checkpoint
 from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
 from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
     build_parameter_sharding_rules,
@@ -63,6 +64,7 @@ QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
 )
 
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
+    checkpoint_export=export_text_checkpoint,
     materialization=register_rotary_materialization,
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
