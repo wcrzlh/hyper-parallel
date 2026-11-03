@@ -96,7 +96,7 @@ dataset:
       trust_remote_code: false
   data_transform:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
-    data_type: conversation
+    data_type: sharegpt
     text_keys: messages
     max_seq_len: 4096
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset

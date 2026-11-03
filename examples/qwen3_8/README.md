@@ -108,7 +108,7 @@ bash examples/qwen3_8/launch_1node_8dies.sh \
 训练前可按同一 tokenizer、chat template、assistant loss mask 和因果移位口径统计 Decif 长度分布：
 
 ```bash
-python examples/qwen3_8/tools/analyze_decif_lengths.py \
+python examples/qwen3_8/tools/analyze_data_distribution.py \
   --data-path "$ONLINE_JSONL" \
   --tokenizer-path "$MODEL_DIR" \
   --max-seq-len 32768 \

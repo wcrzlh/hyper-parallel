@@ -81,7 +81,7 @@ class TestTextConversationTransform(unittest.TestCase):
     def test_openai_messages_remain_unchanged(self):
         """Preserve standard role/content messages and optional loss masks."""
         chat_template = _RecordingChatTemplate()
-        transform = TextConversationTransform(chat_template, max_seq_len=32, text_keys="messages")
+        transform = build_text_transform("sharegpt", chat_template=chat_template, max_seq_len=32, text_keys="messages")
         messages = [
             {"role": "user", "content": "Question", "loss_mask": 0},
             {"role": "assistant", "content": "Answer", "loss_mask": 1},
@@ -97,7 +97,7 @@ class TestTextConversationTransform(unittest.TestCase):
     def test_sharegpt_messages_map_roles_and_content(self):
         """Convert common ShareGPT from/value turns to role/content messages."""
         chat_template = _RecordingChatTemplate()
-        transform = TextConversationTransform(chat_template, max_seq_len=32, text_keys="conversations")
+        transform = build_text_transform("sharegpt", chat_template=chat_template, max_seq_len=32)
 
         transform(
             {
@@ -185,7 +185,7 @@ class TestInstructionDataTransform(unittest.TestCase):
         """Produce identical tensors for instruction and canonical conversation inputs."""
         instruction_template = _RecordingChatTemplate()
         instruction_transform = build_text_transform(
-            "instruction",
+            "alpaca",
             chat_template=instruction_template,
             max_seq_len=32,
             column_mapping={
@@ -228,7 +228,7 @@ class TestInstructionDataTransform(unittest.TestCase):
             with self.subTest(sample=sample):
                 chat_template = _RecordingChatTemplate()
                 transform = build_text_transform(
-                    "instruction",
+                    "alpaca",
                     chat_template=chat_template,
                     max_seq_len=32,
                     column_mapping={
@@ -246,13 +246,13 @@ class TestInstructionDataTransform(unittest.TestCase):
         """Reject missing mappings, required values, and non-string input fields."""
         with self.assertRaises(ValueError):
             build_text_transform(
-                "instruction",
+                "alpaca",
                 chat_template=_RecordingChatTemplate(),
                 max_seq_len=32,
             )
 
         transform = build_text_transform(
-            "instruction",
+            "alpaca",
             chat_template=_RecordingChatTemplate(),
             max_seq_len=32,
             column_mapping={"instruction": "instruction", "input": "input", "output": "output"},

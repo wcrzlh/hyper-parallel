@@ -27,7 +27,7 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.online.format import InstructionMessages, normalize_conversation
 
-TextDataType = Literal["plaintext", "conversation", "instruction"]
+TextDataType = Literal["plaintext", "sharegpt", "alpaca"]
 logger = get_dataset_logger(__name__)
 
 
@@ -200,20 +200,20 @@ def build_text_transform(
         tokenizer: Any = None,
         chat_template: Any = None,
         max_seq_len: int,
-        text_keys: str | Sequence[str] = "text",
+        text_keys: str | Sequence[str] | None = None,
         drop_ragged_tail: bool = False,
         tools_key: str | None = None,
         column_mapping: Mapping[str, str] | None = None,
         input_separator: str = "\n\n",
 ) -> Callable[[Any], Any]:
-    """Build the transform selected by the LLM data type.
+    """Build the transform selected by the text dataset format.
 
     Args:
-        data_type: Plaintext, conversation, or column-mapped instruction format.
+        data_type: One of plaintext, sharegpt, or alpaca.
         tokenizer: Tokenizer used by plaintext transforms.
         chat_template: Chat template used by conversation transforms.
         max_seq_len: Maximum model sequence length.
-        text_keys: Field or candidate fields containing the source text.
+        text_keys: Source field(s); defaults to text or conversations by format.
         drop_ragged_tail: Drop trailing partial plaintext windows.
         tools_key: Optional field containing tool definitions for conversation data.
         column_mapping: Logical instruction/input/output fields mapped to source columns.
@@ -225,24 +225,26 @@ def build_text_transform(
     Raises:
         ValueError: If ``data_type`` is unsupported.
     """
+    if text_keys is None:
+        text_keys = {"sharegpt": "conversations"}.get(data_type, "text")
     if data_type == "plaintext":
         if tools_key is not None:
-            raise ValueError("tools_key is only supported for conversation data")
+            raise ValueError("tools_key is only supported for sharegpt data")
         data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys, drop_ragged_tail)
-    elif data_type == "conversation":
+    elif data_type == "sharegpt":
         data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys, tools_key)
-    elif data_type == "instruction":
+    elif data_type == "alpaca":
         if tools_key is not None:
-            raise ValueError("tools_key is only supported for conversation data")
+            raise ValueError("tools_key is only supported for sharegpt data")
         if column_mapping is None:
-            raise ValueError("column_mapping is required for instruction data")
+            raise ValueError("column_mapping is required for alpaca data")
         data_transform = TextConversationTransform(
             chat_template,
             max_seq_len,
             message_formatter=InstructionMessages(column_mapping, input_separator),
         )
     else:
-        raise ValueError(f"Unsupported text data type: {data_type!r}")
+        raise ValueError(f"Unsupported text data format: {data_type!r}")
 
     logger.debug("Built text transform: data_type=%s, transform=%s", data_type, type(data_transform).__name__)
     return data_transform

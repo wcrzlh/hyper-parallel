@@ -15,7 +15,7 @@
 """Analyze Decif JSONL lengths with the Qwen3.8 training chat template.
 
 Example:
-    python examples/qwen3_8/tools/analyze_decif_lengths.py \
+    python examples/qwen3_8/tools/analyze_data_distribution.py \
         --data-path /home/chaoran/datasets/decif-30k.jsonl \
         --tokenizer-path /home/chaoran/models/Qwen3.8-27B \
         --max-seq-len 32768 \
