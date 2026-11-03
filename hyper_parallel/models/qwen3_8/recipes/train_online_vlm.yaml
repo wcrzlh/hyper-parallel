@@ -30,14 +30,16 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
+  wrapper_class:
+    - Qwen3_5DecoderLayer
+    - Embedding
+    - Qwen3_5VisionBlock
   dp_shard_size: 8
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
     output_dtype: bfloat16
   replicate_params: []
-  root_wrap_modules:
-    - model.language_model.embed_tokens
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true

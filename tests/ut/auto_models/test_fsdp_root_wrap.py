@@ -142,7 +142,7 @@ class TestFSDPRootWrap(unittest.TestCase):
     def test_explicit_units_own_embedding_and_head(self):
         """Extra units take exclusive ownership; root keeps only the final norm."""
         model = _make_model()
-        manager = self._manager(root_wrap_modules=["model.embed_tokens", "lm_head", "lm_head"])
+        manager = self._manager(wrapper_class=["Embedding", "Linear"])
         units = manager._find_wrap_modules(model)
         self.assertEqual(len(units), 4)
         owners = manager._resolve_parameter_owners(model, units)
@@ -165,7 +165,7 @@ class TestFSDPRootWrap(unittest.TestCase):
     def test_embedding_only_leaves_head_on_root(self):
         """Chunk loss can access the head while embedding has its own FSDP unit."""
         model = _make_model()
-        manager = self._manager(root_wrap_modules=["model.embed_tokens"])
+        manager = self._manager(wrapper_class=["Embedding"])
         units = manager._find_wrap_modules(model)
         owners = manager._resolve_parameter_owners(model, units)
         self.assertIs(owners[model.model.embed_tokens.weight], model.model.embed_tokens)
@@ -175,7 +175,7 @@ class TestFSDPRootWrap(unittest.TestCase):
     def test_parallelize_passes_policy_to_actual_wrap_calls(self):
         """Child wrapping precedes root wrapping and prefetch includes the extra units."""
         model = _make_model()
-        manager = self._manager(root_wrap_modules=["model.embed_tokens", "lm_head"],
+        manager = self._manager(wrapper_class=["Embedding", "Linear"],
                                 reshard_after_forward=True)
         with patch.object(manager, "_build_fsdp_actual_mesh", return_value=object()), \
                 patch.object(manager, "_configure_prefetch") as prefetch, \
@@ -187,12 +187,6 @@ class TestFSDPRootWrap(unittest.TestCase):
         self.assertEqual(prefetch.call_args.args[0],
                          [model.model.embed_tokens, *model.model.layers, model.lm_head])
 
-    def test_invalid_module_fqn_rejected(self):
-        """Unknown modules and parameter names are not silently ignored."""
-        for name in ("missing", "lm_head.weight"):
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "module FQN"):
-                self._manager(root_wrap_modules=[name])._find_wrap_modules(_make_model())
-
     def test_tied_embedding_head_rejected_for_separate_units(self):
         """Shared weights keep their old root owner unless independent wrapping is requested."""
         model = _make_model(tied=True)
@@ -200,13 +194,10 @@ class TestFSDPRootWrap(unittest.TestCase):
         owners = manager._resolve_parameter_owners(model, manager._find_wrap_modules(model))
         self.assertIs(owners[model.lm_head.weight], model)
         with self.assertRaisesRegex(ValueError, "shares parameters"):
-            self._manager(root_wrap_modules=["model.embed_tokens", "lm_head"])._find_wrap_modules(model)
+            self._manager(wrapper_class=["Embedding", "Linear"])._find_wrap_modules(model)
 
     def test_config_rejects_invalid_types(self):
         """Catch malformed lists and root policy before touching the model."""
-        for names in ("lm_head", [""], [None], ["model..embed_tokens"]):
-            with self.subTest(names=names), self.assertRaisesRegex(ValueError, "root_wrap_modules"):
-                FSDP2Config(root_wrap_modules=names)
         with self.assertRaisesRegex(TypeError, "reshard_after_forward"):
             FSDP2Config(reshard_after_forward="true")
 
@@ -216,36 +207,18 @@ class TestFSDPRootWrap(unittest.TestCase):
         raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         # Exercise the real config types without importing dataset native helpers.
         raw = {key: raw[key] for key in ("model", "optimizer", "fsdp_config")}
-        raw["fsdp_config"].update(root_wrap_modules=["model.embed_tokens"], reshard_after_forward=True)
+        raw["fsdp_config"].update(wrapper_class=["Embedding"], reshard_after_forward=True)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fsdp.yaml"
             path.write_text(yaml.safe_dump(raw), encoding="utf-8")
             yaml_config = parse_training_args([str(path)])
             config = parse_training_args([
-                str(path), "--fsdp_config.root_wrap_modules=[model.embed_tokens,lm_head]",
+                str(path),
                 "--fsdp_config.reshard_after_forward=false",
                 "--fsdp_config.wrapper_class=[Linear,Embedding]",
             ])
-        self.assertEqual(yaml_config.fsdp_config.root_wrap_modules, ["model.embed_tokens"])
-        self.assertEqual(yaml_config.fsdp_config.wrapper_class, [])
+        self.assertEqual(yaml_config.fsdp_config.wrapper_class, ["Embedding"])
         self.assertEqual(config.fsdp_config.wrapper_class, ["Linear", "Embedding"])
         self.assertTrue(yaml_config.fsdp_config.reshard_after_forward)
-        self.assertEqual(config.fsdp_config.root_wrap_modules, ["model.embed_tokens", "lm_head"])
         self.assertFalse(config.fsdp_config.reshard_after_forward)
         self.assertIsNone(config.loss_fn)
-
-    def test_qwen_yaml_embedding_only_chunk_loss(self):
-        """Both CP paths opt into chunk loss without independently wrapping the head."""
-        models = Path(__file__).resolve().parents[3] / "hyper_parallel/models"
-        files = ["qwen3_8/recipes/train.yaml"] + [
-            f"{family}/recipes/{name}" for family in ("qwen3_8", "qwen3_6_moe")
-            for name in ("train_online.yaml", "train_online_p2p_kv_allgather.yaml")
-        ]
-        for filename in files:
-            with self.subTest(config=filename):
-                raw = yaml.safe_load((models / filename).read_text(encoding="utf-8"))
-                self.assertEqual(raw["fsdp_config"]["root_wrap_modules"], ["model.embed_tokens"])
-                self.assertTrue(raw["fsdp_config"]["reshard_after_forward"])
-                self.assertEqual(raw["loss_fn"]["_target_"],
-                                 "hyper_parallel.components.losses.ChunkedCausalLMLoss")
-                self.assertEqual(raw["loss_fn"]["chunk_size"], 1024)

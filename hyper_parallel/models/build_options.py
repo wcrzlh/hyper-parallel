@@ -210,10 +210,6 @@ class FSDP2Config:
     list retains automatic decoder discovery; expert units are discovered in
     either mode.
 
-    ``root_wrap_modules`` adds exact module FQNs (for example,
-    ``model.embed_tokens`` and ``lm_head``) as independent child units. Their
-    reshard policy follows ``reshard_after_forward``. Parameters shared outside
-    an explicitly selected subtree are rejected rather than split across units.
     ``reshard_after_forward`` also controls the remaining root parameters.
     """
     dp_shard_size: int = 1
@@ -230,8 +226,6 @@ class FSDP2Config:
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
     comm_fusion_zero_copy: Optional[bool] = None
-    # Exact module FQNs to wrap independently in addition to decoder blocks.
-    root_wrap_modules: list[str] = field(default_factory=list)
     # Exact runtime class names; empty preserves automatic decoder discovery.
     wrapper_class: list[str] = field(default_factory=list)
 
@@ -251,11 +245,7 @@ class FSDP2Config:
             raise ValueError("forward_prefetch_depth must be greater than or equal to 0")
         if not isinstance(self.reshard_after_forward, bool):
             raise TypeError("reshard_after_forward must be a bool")
-        if not isinstance(self.root_wrap_modules, list) or any(
-            not isinstance(name, str) or not name or any(not part for part in name.split("."))
-            for name in self.root_wrap_modules
-        ):
-            raise ValueError("root_wrap_modules must be a list of non-empty module FQNs")
+
 
 
 _MODEL_INIT_DTYPES = ("float16", "bfloat16", "float32")

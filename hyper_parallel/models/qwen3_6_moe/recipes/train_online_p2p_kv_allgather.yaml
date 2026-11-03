@@ -30,6 +30,9 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
+  wrapper_class:
+    - Qwen3_5MoeDecoderLayer
+    - Embedding
   dp_shard_size: 8
   mix_precision:
     param_dtype: bfloat16
@@ -39,8 +42,6 @@ fsdp_config:
   # partition across all four EDP ranks, leaving no replicated EDP axis.
   edp_shard_size: 4
   replicate_params: []
-  root_wrap_modules:
-    - model.embed_tokens
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true

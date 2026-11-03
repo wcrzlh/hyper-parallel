@@ -79,7 +79,7 @@ class TestBuildOptionsFields(unittest.TestCase):
                 "reshard_after_backward", "requires_grad_sync",
                 "backward_prefetch_depth", "forward_prefetch_depth",
                 "comm_fusion", "comm_fusion_zero_copy",
-                "root_wrap_modules", "wrapper_class",
+                "wrapper_class",
             ],
         )
         config = FSDP2Config()
@@ -88,7 +88,6 @@ class TestBuildOptionsFields(unittest.TestCase):
         self.assertIsInstance(config.mix_precision, FSDP2MixedPrecisionConfig)
         self.assertIsNone(config.mix_precision.param_dtype)
         self.assertIsNone(config.comm_fusion_zero_copy)
-        self.assertEqual(config.root_wrap_modules, [])
         self.assertTrue(config.reshard_after_forward)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

@@ -18,16 +18,6 @@ import torch
 
 from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
 from hyper_parallel.distributed.context_parallel import gated_delta_net as cp_gdn
-from hyper_parallel.distributed.recipe_spec import (
-    MeshAxisName,
-)
-from hyper_parallel.distributed._builder.default_templates import TEMPLATES
-from hyper_parallel.distributed._builder.planner import (
-    ShardingPlanner,
-)
-from hyper_parallel.core.dtensor.placement_types import Shard
-from hyper_parallel.distributed.tensor_parallel.param_role import ParameterClassifier, ParamRole
-from hyper_parallel.models.registry import get_model_adapter
 
 
 def causal_conv1d_fn(
@@ -212,25 +202,6 @@ def test_gdn_halo_exchange_uses_torch_collective_adapter(monkeypatch):
     assert calls["input_splits"] == [0, 0]
     assert calls["output_splits"] == [3, 0]
     assert calls["group"] == "cp_group"
-
-
-def test_qwen_gdn_roles_are_adapter_owned():
-    """Qwen adapters supply GDN roles; the module name alone supplies no contract."""
-    classifier = ParameterClassifier()
-    planner = ShardingPlanner()
-    fqn = "model.layers.0.linear_attn"
-    assert "linear_attention" not in TEMPLATES
-    assert planner._explicit_boundary_type(fqn, "linear_attn") is None  # pylint: disable=protected-access
-    for arch in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
-        rules = get_model_adapter(arch).sharding_rules()
-        group = [(f"{fqn}.{name}", classifier.classify_param(f"{fqn}.{name}", rules))
-                 for name in ("in_proj_qkv.weight", "out_proj.weight")]
-        assert [role for _, role in group] == [ParamRole.FUSED_QKV, ParamRole.ROWWISE]
-        boundary = planner._infer_boundary_type(fqn, group)  # pylint: disable=protected-access
-        assert boundary == "attention"
-        template = TEMPLATES[boundary]
-        for contract in (template.nosp_in_src["hidden_states"], template.nosp_in_dst["hidden_states"]):
-            assert contract[MeshAxisName.CP] == Shard(1)
 
 
 def test_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):

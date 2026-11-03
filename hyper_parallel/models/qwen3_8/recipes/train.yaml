@@ -32,10 +32,11 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
+  wrapper_class:
+    - Qwen3_5DecoderLayer
+    - Embedding
   dp_shard_size: 8
   replicate_params: []
-  root_wrap_modules:
-    - model.embed_tokens
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
