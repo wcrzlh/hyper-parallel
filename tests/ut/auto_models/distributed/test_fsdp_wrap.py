@@ -203,7 +203,7 @@ class TestFSDPRootWrap(unittest.TestCase):
 
     def test_cli_overrides_reach_fsdp_config(self):
         """The real Trainer parser accepts both new fields without changing YAML defaults."""
-        yaml_path = Path(__file__).resolve().parents[3] / "hyper_parallel/models/qwen3_8/recipes/train_online.yaml"
+        yaml_path = Path(__file__).resolve().parents[4] / "hyper_parallel/models/qwen3_8/recipes/train_online.yaml"
         raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         # Exercise the real config types without importing dataset native helpers.
         raw = {key: raw[key] for key in ("model", "optimizer", "fsdp_config")}

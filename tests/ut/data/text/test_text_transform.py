@@ -116,22 +116,11 @@ class TestTextConversationTransform(unittest.TestCase):
             ],
         )
 
-    def test_invalid_conversation_shapes_raise_value_error(self):
-        """Reject unsupported message containers, fields, and ShareGPT roles."""
+    def test_invalid_conversation_error_propagates(self):
+        """Propagate format validation failures through the transform."""
         transform = TextConversationTransform(_RecordingChatTemplate(), max_seq_len=32)
-        invalid_messages = [
-            "not-a-list",
-            ["not-a-mapping"],
-            [{"role": "user"}],
-            [{"from": "human"}],
-            [{"from": "function_call", "value": "{}"}],
-            [{"text": "missing role"}],
-        ]
-
-        for messages in invalid_messages:
-            with self.subTest(messages=messages):
-                with self.assertRaises(ValueError):
-                    transform({"conversation": messages})
+        with self.assertRaises(ValueError):
+            transform({"conversation": [{"role": "user"}]})
 
     def test_tools_are_forwarded_only_when_tools_key_is_configured(self):
         """Keep tools opt-in and accept JSON-serialized tool definitions."""
