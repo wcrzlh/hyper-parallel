@@ -99,6 +99,9 @@ compile:
 dataset:
   model_assets:
     chat_template: tokenizer
+    chat_template_kwargs:
+      reasoning_effort: medium
+      preserve_thinking: true
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /data1/w00842045/models/Qwen/Qwen3.6-35B-A3B-kvfirst-mla-gkd-thinking
@@ -109,6 +112,7 @@ dataset:
   data_transform:
     _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
     data_type: conversation
+    thinking_mode: auto
     text_keys: messages
     max_seq_len: 32768
 
@@ -121,8 +125,7 @@ dataset:
     labels_are_shifted: true
 
 dataloader:
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
-  min_buffered_samples: 16
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
