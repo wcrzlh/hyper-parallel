@@ -19,12 +19,16 @@ from hyper_parallel.models.registry import register_model_adapter
 
 
 def _load_sharding_rules():
-    """Return GDN and shared-expert parameter role overrides."""
+    """Return GDN, MLA KV, and shared-expert parameter role overrides."""
     from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
         ParamRole,
     )
 
     return [
+        # Remote-code MLA models retain the qwen3_5_moe_text identity.
+        # Keep the compressed latent replicated; shard the expanded heads only with TP.
+        ("kv_a_proj.", ParamRole.REPLICATED),
+        ("kv_b_proj.", ParamRole.COLWISE),
         ("in_proj_qkv", ParamRole.FUSED_QKV),
         (["in_proj_z", "in_proj_b", "in_proj_a", "conv1d"], ParamRole.COLWISE),
         (["A_log", "dt_bias"], ParamRole.COLWISE),
