@@ -31,7 +31,7 @@ from .utils import prepare_chunk_indices, exp
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT'])
 def prepare_wy_repr_bwd_kernel(
         k,
         v,
@@ -51,7 +51,7 @@ def prepare_wy_repr_bwd_kernel(
         H: tl.constexpr,
         K: tl.constexpr,
         V: tl.constexpr,
-        NT: tl.constexpr,
+        NT,
         BT: tl.constexpr,
         BK: tl.constexpr,
         BV: tl.constexpr,
@@ -163,7 +163,7 @@ def prepare_wy_repr_bwd_kernel(
     'USE_GK': lambda args: args['gk'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T_tmp', 'NT'])
 def recompute_w_u_fwd_kernel(
         k,
         v,
@@ -180,7 +180,7 @@ def recompute_w_u_fwd_kernel(
         H: tl.constexpr,
         K: tl.constexpr,
         V: tl.constexpr,
-        NT: tl.constexpr,
+        NT,
         BT: tl.constexpr,
         BK: tl.constexpr,
         BV: tl.constexpr,
