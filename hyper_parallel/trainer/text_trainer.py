@@ -244,7 +244,7 @@ class TextTrainer:
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
-        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        model_inputs, loss_inputs = BaseTrainer.next_training_batch(self.base, data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
         metric_inputs = {
             **model_inputs,
@@ -275,6 +275,8 @@ class TextTrainer:
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
+        if getattr(self.base.loss_fn, "requires_step_token_plan", False):
+            self.base.prepare_loss_step(data_iterator)
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 

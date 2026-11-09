@@ -53,6 +53,7 @@ def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
     current_token_counts: dict[str, torch.Tensor],
     device_mesh: "MeshContext",
+    token_normalization_weights: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Calculate global loss numerators using explicit mesh information.
 
@@ -65,6 +66,8 @@ def mean_global_loss(
         losses: A loss tensor or mapping of named loss tensors.
         current_token_counts: Token counts for the current micro batch.
         device_mesh: Trainer mesh context containing parallel sizes and groups.
+        token_normalization_weights: Optional optimizer-step reference/family token ratios.
+            Required for independently normalized objectives sharing one backward pass.
 
     Returns:
         Token-weighted loss numerators keyed by loss name.
@@ -87,11 +90,13 @@ def mean_global_loss(
     if isinstance(losses, torch.Tensor):  # text loss only
         losses = {"foundation_loss": losses}
 
-    if len({key.split("_loss", maxsplit=1)[0] for key in losses}) != 1:
+    if len({key.split("_loss", maxsplit=1)[0] for key in losses}) != 1 and token_normalization_weights is None:
         raise ValueError("Step gradient normalization requires losses sharing one token-count family")
 
     for key, cur_loss in losses.items():
         loss_name = key.split("_loss", maxsplit=1)[0]  # foundation/image_decoder/**
+        if token_normalization_weights is not None:
+            cur_loss = cur_loss * token_normalization_weights[loss_name]
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:

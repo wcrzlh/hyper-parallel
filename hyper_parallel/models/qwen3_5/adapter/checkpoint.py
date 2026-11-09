@@ -14,6 +14,8 @@
 # ============================================================================
 """Qwen text checkpoint export policy shared by dense and MoE adapters."""
 
+from __future__ import annotations
+
 from typing import Any
 
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
@@ -33,6 +35,14 @@ def export_text_checkpoint(
     Returns:
         Weights and the resolved flag for subsequent HF reverse conversion.
     """
+    if getattr(model, "_hp_mtp_enabled", False):
+        rope = getattr(model.config, "rope_parameters", None)
+        if isinstance(rope, dict):
+            rope.pop("mrope_section", None)
+            rope.pop("mrope_interleaved", None)
+        export_class = getattr(model, "_hp_mtp_export_class", None)
+        if export_class is not None:
+            model.__class__ = export_class
     if save_original_format is True:
         return state_dict, True
     replacements = getattr(model, "_hp_used_replacement_weight_conversions", None)

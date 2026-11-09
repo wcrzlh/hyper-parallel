@@ -17,14 +17,15 @@
 from functools import partial, wraps
 from typing import Any
 
-import torch
-from torch.nn import functional
+import torch  # pylint: disable=forbidden-backend-import
+from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature
 from hyper_parallel.models import HyperAutoModelForImageTextToText
 from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMCPInputs
 from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import _chunk_loss_forward
+from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import mtp_forward
 
 
 def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLMCPInputs,
@@ -92,7 +93,7 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
         if bool((geometry.input_ids[~geometry.attention_mask.bool()] == model.config.image_token_id).any()):
             raise ValueError("Qwen VLM CP padding must not contain image placeholders")
         images = bridge.parse_images({**kwargs, "vlm_global_input_ids": geometry.input_ids})
-        if geometry.cp_size == 1:
+        if geometry.cp_size == 1 and "mtp_targets" not in kwargs:
             if "chunk_loss_targets" in kwargs:
                 return _chunk_loss_forward(model, **kwargs)
             return original_forward(*args, **kwargs)
@@ -130,7 +131,10 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
             kwargs.pop(field, None)
         forward_impl = original_forward
         chunked = "chunk_loss_targets" in kwargs
-        if chunked:
+        if "mtp_targets" in kwargs:
+            kwargs["mtp_attention_mask"] = geometry.attention_mask
+            forward_impl = partial(mtp_forward, model)
+        elif chunked:
             # Use the VLM loss adapter directly so either binding order is safe.
             forward_impl = partial(_chunk_loss_forward, model)
         output = forward_impl(

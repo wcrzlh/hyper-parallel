@@ -113,6 +113,7 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
             runtime_inputs = self._build_runtime_inputs(batch)
             model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
             model_inputs.update(runtime_inputs)
+            loss_inputs.update(self.runtime_input_adapter.build_loss_inputs(runtime_inputs))
             model_inputs["vlm_cp_inputs"] = geometry
             self._add_chunk_targets(loss_inputs, targets)
             return model_inputs, loss_inputs
@@ -129,6 +130,7 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         batch.pop("vlm_global_input_ids")
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
         model_inputs.update(runtime_inputs)
+        loss_inputs.update(self.runtime_input_adapter.build_loss_inputs(runtime_inputs))
         model_inputs["vlm_cp_inputs"] = geometry
         self._add_chunk_targets(loss_inputs, targets)
         return model_inputs, loss_inputs

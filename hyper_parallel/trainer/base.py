@@ -799,10 +799,10 @@ class BaseTrainer(Stateful, ABC):
         for foundation_loss in foundation_losses:
             if foundation_loss is not None:
                 bind_aux_loss_scale(foundation_loss)
+        normalization = getattr(self, "loss_token_normalization_weights", None)
+        normalization_kwargs = {} if normalization is None else {"token_normalization_weights": normalization}
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            local_loss,
-            current_token_counts,
-            device_mesh=self.mesh,
+            local_loss, current_token_counts, device_mesh=self.mesh, **normalization_kwargs,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         # Model-declared extra metrics join the logged mapping only after
@@ -976,6 +976,35 @@ class BaseTrainer(Stateful, ABC):
     def begin_loss_step(self) -> None:
         """Reset scalar counters before reading the next optimizer step."""
         self.step_token_counts = {}
+        self.loss_token_normalization_weights = None
+        self._prepared_loss_batches = None
+
+    def prepare_loss_step(self, data_iterator: Any) -> None:
+        """Plan independent objective denominators before a shared backward pass.
+
+        This opt-in path buffers only prepared input batches, never activations.
+        The default single-family path retains its streaming and arithmetic order.
+        All objectives are expressed in reference-family token units, so existing
+        final gradient division remains valid even with unequal microbatch lengths.
+        """
+        batches = [self.get_batch(data_iterator) for _ in range(self.num_micro_batches)]
+        counts = count_loss_token([loss_inputs for _, loss_inputs in batches])
+        names = sorted(name for name in counts if name.endswith("_tokens") and name != "image_decoder_tokens")
+        totals = torch.stack([counts[name].to(self.device) for name in names]).detach()
+        mesh = self.mesh.dp_cp_mesh
+        if mesh is not None and mesh.size() > 1:
+            torch.distributed.all_reduce(totals, group=mesh.get_group())
+        reference = totals[names.index("foundation_tokens")].clamp_min(1)
+        self.loss_token_normalization_weights = {
+            name.removesuffix("_tokens"): reference / total.clamp_min(1)
+            for name, total in zip(names, totals)
+        }
+        self._prepared_loss_batches = iter(batches)
+
+    def next_training_batch(self, data_iterator: Any) -> Any:
+        """Read a planned multi-objective batch or preserve ordinary streaming."""
+        prepared = getattr(self, "_prepared_loss_batches", None)
+        return next(prepared) if prepared is not None else self.get_batch(data_iterator)
 
     def _loss_denominator(self) -> float:
         """Return the optimizer-step valid-token count across DP/CP."""

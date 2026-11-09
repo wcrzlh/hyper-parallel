@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
 """Loss token counting for trainer-side aggregation."""
 
 from typing import Union
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 
@@ -59,7 +61,8 @@ def count_loss_token(
             for key in obj.keys():
                 if key.endswith("_labels") and key != "shift_labels":
                     token_name = key.split("_labels")[0]
-                    token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
+                    count_name = f"{token_name}_tokens"
+                    token_len[count_name] = token_len.get(count_name, 0) + torch.sum(obj[key] != IGNORE_INDEX)
 
             if "image_output_mask" in obj:
                 image_decoder_tokens = torch.sum(obj["image_output_mask"])

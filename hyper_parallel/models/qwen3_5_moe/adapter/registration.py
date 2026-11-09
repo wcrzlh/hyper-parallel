@@ -51,6 +51,14 @@ def _load_vlm_loss():
     return vlm_chunk_loss
 
 
+def _export_vlm_checkpoint(model, state_dict, save_original_format):
+    """Keep the native VLM task name on an isolated MTP export view."""
+    export_class = getattr(model, "_hp_mtp_export_class", None)
+    if export_class is not None:
+        model.__class__ = export_class
+    return state_dict, save_original_format is not False
+
+
 def _load_encoder_parallel():
     """Load the opt-in visual runtime without importing optional HF vision code."""
     from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import (  # pylint: disable=C0415
@@ -60,6 +68,7 @@ def _load_encoder_parallel():
 
 
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
+    checkpoint_export=_export_vlm_checkpoint,
     materialization=register_rotary_materialization,
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",

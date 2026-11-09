@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 
 class OnlineBoundaryResolver:
@@ -166,6 +166,24 @@ class RuntimeInputAdapter(ABC):
         diagnostics can reject collisions before interpreting precision runs.
         """
         return ()
+
+    def loss_input_aliases(self) -> Mapping[str, str]:
+        """Declare loss-only aliases of this adapter's forward metadata.
+
+        The default declares no extra loss fields. Aliases cannot replace
+        encoded labels/masks, and must refer to declared runtime-owned fields.
+        """
+        return {}
+
+    def build_loss_inputs(self, runtime_inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """Project declared labels for counting without recomputing or copying them."""
+        fields = set(self.runtime_input_fields())
+        aliases = self.loss_input_aliases()
+        if any(source not in fields or source not in runtime_inputs for source in aliases.values()):
+            raise ValueError("Loss aliases must reference present, declared runtime fields")
+        if any(not name.endswith("_labels") or name == "shift_labels" for name in aliases):
+            raise ValueError("Runtime loss aliases must be auxiliary *_labels fields")
+        return {name: runtime_inputs[source] for name, source in aliases.items()}
 
     @abstractmethod
     def build_runtime_inputs(

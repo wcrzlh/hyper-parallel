@@ -132,6 +132,11 @@ class OmniParallelBatch:
             raise ValueError("batch transport cannot replace Omni model or runtime inputs")
         model_inputs.update(runtime_inputs)
         model_inputs.update(transport_inputs)
+        if self.runtime_input_adapter is not None:
+            auxiliary_inputs = self.runtime_input_adapter.build_loss_inputs(runtime_inputs)
+            if set(auxiliary_inputs).intersection(loss_inputs):
+                raise ValueError("Runtime loss aliases cannot replace framework-owned loss fields")
+            loss_inputs.update(auxiliary_inputs)
         # Shapes are host metadata; inspecting device tensor values here can stall collectives.
         logger.debug(
             "Omni get_batch: batch=%d transport_ready fields=%s runtime_fields=%s",
@@ -518,4 +523,9 @@ class TextParallelBatch:
         if self.labels_are_shifted:
             loss_inputs["shift_labels"] = parallel_batch["labels"]
 
+        if self.runtime_input_adapter is not None:
+            auxiliary_inputs = self.runtime_input_adapter.build_loss_inputs(runtime_inputs)
+            if set(auxiliary_inputs).intersection(loss_inputs):
+                raise ValueError("Runtime loss aliases cannot replace framework-owned loss fields")
+            loss_inputs.update(auxiliary_inputs)
         return model_inputs, loss_inputs
