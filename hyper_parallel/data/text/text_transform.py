@@ -21,11 +21,15 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.online.format import InstructionMessages, normalize_conversation
+from hyper_parallel.data.online.format import (
+    InstructionMessages,
+    normalize_conversation,
+)
+from hyper_parallel.data.thinking import validate_thinking_mode
 
 TextDataType = Literal["plaintext", "sharegpt", "alpaca"]
 logger = get_dataset_logger(__name__)
@@ -72,11 +76,15 @@ def _encode_messages(
         messages: Sequence[Mapping[str, Any]],
         max_seq_len: int,
         tools: Sequence[Mapping[str, Any]] | None = None,
+        thinking_mode: str = "legacy",
+        enable_thinking: bool | None = None,
 ) -> dict[str, Any]:
     """Encode normalized messages into a shifted causal-language-model sample."""
     encode_kwargs = {"max_seq_len": max_seq_len}
     if tools:
         encode_kwargs["tools"] = tools
+    if thinking_mode != "legacy" or enable_thinking is not None:
+        encode_kwargs.update(thinking_mode=thinking_mode, enable_thinking=enable_thinking)
     encoded = chat_template.encode_messages(messages, **encode_kwargs)
     input_ids = torch.tensor(encoded["input_ids"], dtype=torch.int64)
     labels = torch.tensor(encoded["labels"], dtype=torch.int64)
@@ -166,6 +174,7 @@ class TextConversationTransform:
     text_keys: str | Sequence[str] = "conversation"
     tools_key: str | None = None
     message_formatter: Callable[[Mapping[str, Any]], list[dict[str, Any]]] | None = None
+    thinking_mode: str = "legacy"
 
     def __post_init__(self) -> None:
         """Validate the chat template and sequence length configuration."""
@@ -175,6 +184,7 @@ class TextConversationTransform:
             raise ValueError("max_seq_len must be positive")
         if self.tools_key is not None and (not isinstance(self.tools_key, str) or not self.tools_key):
             raise ValueError("tools_key must be a non-empty string or None")
+        validate_thinking_mode(self.thinking_mode)
 
     def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
@@ -183,7 +193,10 @@ class TextConversationTransform:
         tools = None
         if self.tools_key is not None:
             tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)
-        encoded = _encode_messages(self.chat_template, messages, self.max_seq_len, tools)
+        encoded = _encode_messages(
+            self.chat_template, messages, self.max_seq_len, tools,
+            self.thinking_mode, sample.get("enable_thinking"),
+        )
         return [encoded] if bool(encoded["labels"].ne(IGNORE_INDEX).any()) else []
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
@@ -205,6 +218,7 @@ def build_text_transform(
         tools_key: str | None = None,
         column_mapping: Mapping[str, str] | None = None,
         input_separator: str = "\n\n",
+        thinking_mode: str = "legacy",
 ) -> Callable[[Any], Any]:
     """Build the transform selected by the text dataset format.
 
@@ -218,6 +232,7 @@ def build_text_transform(
         tools_key: Optional field containing tool definitions for conversation data.
         column_mapping: Logical instruction/input/output fields mapped to source columns.
         input_separator: Separator inserted between non-empty instruction and input fields.
+        thinking_mode: Sample-local reasoning detection policy for conversation data.
 
     Returns:
         The configured text sample transform.
@@ -225,14 +240,19 @@ def build_text_transform(
     Raises:
         ValueError: If ``data_type`` is unsupported.
     """
+    validate_thinking_mode(thinking_mode)
     if text_keys is None:
         text_keys = {"sharegpt": "conversations"}.get(data_type, "text")
     if data_type == "plaintext":
+        if thinking_mode != "legacy":
+            raise ValueError("thinking_mode is only supported for conversation data")
         if tools_key is not None:
             raise ValueError("tools_key is only supported for sharegpt data")
         data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys, drop_ragged_tail)
     elif data_type == "sharegpt":
-        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys, tools_key)
+        data_transform = TextConversationTransform(
+            chat_template, max_seq_len, text_keys, tools_key, thinking_mode=thinking_mode,
+        )
     elif data_type == "alpaca":
         if tools_key is not None:
             raise ValueError("tools_key is only supported for sharegpt data")
@@ -242,6 +262,7 @@ def build_text_transform(
             chat_template,
             max_seq_len,
             message_formatter=InstructionMessages(column_mapping, input_separator),
+            thinking_mode=thinking_mode,
         )
     else:
         raise ValueError(f"Unsupported text data format: {data_type!r}")
