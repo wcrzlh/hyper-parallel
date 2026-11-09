@@ -134,12 +134,17 @@ _ARCH_SUFFIXES = (
 )
 
 
+def _normalize_model_key(name: str) -> str:
+    """Normalize spelling without discarding the model's task identity."""
+    return name.lower().replace("_", "").replace("-", "")
+
+
 def _normalize_family_key(name: str) -> str:
     """Canonical lookup key: lowercase, separators removed, HF task suffix
     stripped — so the architectures spelling (``deepseekv3``), the model_type
     spelling (``deepseek_v3``) and the class spelling
     (``DeepseekV3ForCausalLM``) all resolve to the same family."""
-    key = name.lower().replace("_", "").replace("-", "")
+    key = _normalize_model_key(name)
     for suffix in _ARCH_SUFFIXES:
         if key.endswith(suffix):
             key = key[: -len(suffix)]
@@ -184,6 +189,8 @@ def register_model_adapter(spec: ModelAdapterSpec) -> None:
         )
     MODEL_ADAPTER_REGISTRY[spec.model_type] = spec
     for alias in (
+            _normalize_model_key(spec.model_type),
+            _normalize_model_key(spec.architecture),
             _normalize_family_key(spec.model_type),
             _normalize_family_key(spec.architecture),
     ):
@@ -202,7 +209,8 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
     """
     spec = MODEL_ADAPTER_REGISTRY.get(model_type)
     if spec is None:
-        canonical = _FAMILY_ALIASES.get(_normalize_family_key(model_type))
+        canonical = (_FAMILY_ALIASES.get(_normalize_model_key(model_type))
+                     or _FAMILY_ALIASES.get(_normalize_family_key(model_type)))
         if canonical is not None:
             spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     if spec is None:
@@ -217,7 +225,7 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
             importlib.import_module(module_path)
             spec = MODEL_ADAPTER_REGISTRY.get(model_type)
         if spec is None:
-            canonical = _FAMILY_ALIASES.get(key)
+            canonical = _FAMILY_ALIASES.get(_normalize_model_key(model_type)) or _FAMILY_ALIASES.get(key)
             if canonical is not None:
                 spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     return spec
