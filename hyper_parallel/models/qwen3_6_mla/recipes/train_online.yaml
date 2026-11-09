@@ -5,13 +5,13 @@
 #     → 最终调用 F.scaled_dot_product_attention
 #     → CP: sdpa_hf_ulysses (拦截 F.sdpa, Ulysses seq/head 交换)
 #   - linear_attention: Qwen3_5MoeGatedDeltaNet (GDN)
-#     → 调用 self.causal_conv1d_fn + self.chunk_gated_delta_rule
+#     → TritonGDN 替换 self.chunk_gated_delta_rule
 #     → CP: gdn_ulysses (拦截 GDN primitives, Ulysses 交换)
 #
-# 数据: sft_hybrid_long_16k_plus.jsonl (14963 条, 16K-44K tokens)
-# 格式: conversation (messages), 使用 tokenizer 原生 chat template
+# 数据: conversation (messages), 使用 tokenizer 原生 chat template
+# 保留长序列实验规模，对齐普通 MoE 示例的融合算子与并行策略。
 #
-# 拓扑: 16 chips, CP=2, FSDP=8, EP=1 (MoE 参数走 FSDP)
+# 拓扑: CP=2, FSDP=8, EP=2, EDP shard=4
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
@@ -38,14 +38,13 @@ training:
 accelerator:
   tp_size: 1
   cp_size: 2
-  ep_size: 1
+  ep_size: 2
   pp_size: 1
   sequence_parallel: false
   loss_parallel: false
 
 fsdp_config:
   dp_shard_size: 8
-  replicate_params: []
   # Canonical mixed-precision recipe for optimizer stability: bf16 compute
   # params/gradients with an fp32 master copy and fp32 optimizer states. This
   # doubles optimizer-state memory versus bf16-only updates, so a 35B model on
@@ -53,7 +52,11 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
+  edp_shard_size: 4
+  replicate_params: []
+  wrapper_class:
+    - Qwen3_5MoeDecoderLayer
+    - Embedding
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
@@ -62,18 +65,36 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # Full attention (MLA) CP: 拦截 F.sdpa, Ulysses seq→head 交换
-  - match: "*.self_attn"
-    when: cp
-    inner_target: self
-    inner_wrapper: sdpa_hf_ulysses
-    region_dispatch: false
-  # GDN linear attention CP: 拦截 causal_conv1d_fn + chunk_gated_delta_rule
+  # Remote-code classes differ from HF; factories validate the required structure.
   - match: "*.linear_attn"
+    replace:
+      kind: module
+      source_type: torch.nn.Module
+      implementation:
+        _target_: hyper_parallel.components.modules.TritonGDN
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      source_type: torch.nn.Module
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+  - match: "*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
+        use_grouped_gemm: true
+  - match: "*.self_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper: gdn_ulysses
-    region_dispatch: false
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_ulysses_cp_wrapper
+  - match: "*.linear_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.gdn_ulysses_cp_wrapper
 
 mixed_precision:
   enabled: false
@@ -84,8 +105,8 @@ activation_checkpoint:
 activation_swap: none
 
 loss_fn:
-  _target_: hyper_parallel.components.losses.chunked_cross_entropy.ChunkedCausalLMLoss
-  chunk_size: 2048
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
+  chunk_size: 1024
 
 compile:
   enabled: false
@@ -99,6 +120,9 @@ compile:
 dataset:
   model_assets:
     chat_template: tokenizer
+    chat_template_kwargs:
+      reasoning_effort: medium
+      preserve_thinking: true
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /data1/w00842045/models/Qwen/Qwen3.6-35B-A3B-kvfirst-mla-gkd-thinking
@@ -107,30 +131,29 @@ dataset:
       trust_remote_code: true
 
   data_transform:
-    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
-    data_type: conversation
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: sharegpt
+    thinking_mode: auto
     text_keys: messages
     max_seq_len: 32768
 
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: /data1/w00842045/data/sft_hybrid_long_16k_plus.jsonl
   data_config:
     dataset_type: mapping
     hf_dataset_name: null
-    create_attention_mask_in_dataloader: true
+    create_attention_mask_in_dataloader: false
     labels_are_shifted: true
 
 dataloader:
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
-  min_buffered_samples: 16
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
-    _target_: hyper_parallel.data.batching.ParallelBatch
+    _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
     attention_mode: dense
-    cp_algorithm: ulysses
-  dataloader_type: cyclic
+  sampler_type: cyclic
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
@@ -155,6 +178,7 @@ lr_scheduler:
   _target_: hyper_parallel.components.optim.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
+    lr: 1.0e-5
     lr_warmup_steps: 10
     min_lr: 1.0e-6
 
@@ -173,16 +197,15 @@ checkpoint:
   restore_train_state: true
 
 debug:
+  log_first_rendered_template: true
   check_nan_inf: false
   check_dataset: null
 
-profiling:
-  enabled: false
+profiler:
+  enable: false
   start_step: 3
-  end_step: 4
-  trace_dir: /data3/w00842045/output/qwen36mla-cp-train/profiling
-  record_shapes: false
-  profile_memory: false
+  stop_step: 4
+  output_path: /data3/w00842045/output/qwen36mla-cp-train/profiling
+  memory: false
   with_stack: false
-  with_modules: false
-  rank: 0
+  rank_ids: [0]

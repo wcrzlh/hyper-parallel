@@ -38,5 +38,5 @@ torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module examples.qwen3_8.train_text \
-    "${SCRIPT_DIR}/train_qwen36mla_cp.yaml" \
+    "${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_mla/recipes/train_online.yaml" \
     "$@"

@@ -28,6 +28,9 @@ def _load_sharding_rules():
     )
 
     return [
+        # Remote-code MLA models retain the qwen3_5_moe_text identity.
+        ("kv_a_proj.", ParamRole.REPLICATED),
+        ("kv_b_proj.", ParamRole.COLWISE),
         ("in_proj_qkv", ParamRole.FUSED_QKV),
         (["in_proj_z", "in_proj_b", "in_proj_a", "conv1d"], ParamRole.COLWISE),
         (["A_log", "dt_bias"], ParamRole.COLWISE),
