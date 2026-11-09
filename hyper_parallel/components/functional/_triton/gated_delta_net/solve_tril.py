@@ -48,7 +48,7 @@ FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NT"])
 def solve_tril_16x16_loop_kernel_paral_v3(
         A_ptr,
         Ad_ptr,
@@ -59,7 +59,7 @@ def solve_tril_16x16_loop_kernel_paral_v3(
         BT: tl.constexpr,
         IS_VARLEN: tl.constexpr,
         LARGE_BLOCK_T: tl.constexpr,
-        NT: tl.constexpr,
+        NT,
         BH: tl.constexpr,
 ):
     worker_id = tl.program_id(0)
