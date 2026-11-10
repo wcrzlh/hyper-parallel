@@ -1,5 +1,6 @@
 # Eight-rank text packing smoke: GDN P2P + full-attention KV all-gather.
-# Full attention uses a quadratic dense document mask; verify memory before scaling beyond 32K.
+# Full attention consumes cu_seq_lens through NPU varlen attention; no quadratic document mask.
+# For a dense reference, use sdpa_hf_cp_wrapper and attention_mode: dense below.
 # Decoder patterns assume the released 40-layer schedule: every fourth layer is full attention.
 
 model:
@@ -84,7 +85,7 @@ plan_overrides:
     when: cp
     replace:
       kind: method
-      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
+      implementation: hyper_parallel.distributed.context_parallel.packed_attention.packed_allgather_hf_cp_wrapper
   # Linear HF decoders otherwise discard packed metadata before calling the mixer.
   # Match only linear decoders; never wrap the full-attention decoder with this rule.
   - &packed_decoder
@@ -158,7 +159,7 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: packed_text
-    attention_mode: dense
+    attention_mode: compressed
     runtime_input_adapter:
       _target_: hyper_parallel.models.qwen3_5.adapter.data.runtime.Qwen35PackedRuntime
   sampler_type: cyclic
