@@ -14,7 +14,8 @@
 # ============================================================================
 """Packed linear-attention sample isolation and layout regression tests."""
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, is_dataclass
+import pickle
 from typing import Any
 import unittest
 
@@ -36,10 +37,46 @@ from hyper_parallel.models.qwen3_5.adapter.data.runtime import Qwen35PackedRunti
 from hyper_parallel.models.kimi_k3.adapter.data.runtime import KimiK3PackedRuntime
 from hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel import qwen3_5_packed_decoder_wrapper
 from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
+from hyper_parallel.core.fully_shard.utils import apply_to_tensors, cast_fp_tensor
 
 
 class TestLinearAttentionPacked(unittest.TestCase):
     """Check real reset semantics independently of device and transport."""
+
+    def test_metadata_and_cached_plans_survive_fsdp_cast(self):
+        """FSDP casts activations without reconstructing opaque packed metadata."""
+        info = PackedSequenceInfo((0, 3, 8), start=2, end=6)
+        plan = info.materialize(torch.device("cpu"), 2)
+        view = info.interval(0, 8)
+        hidden = torch.ones(1, 4, 2, requires_grad=True)
+        inputs = {"hidden_states": hidden, "packed_sequence_info": info}
+        for _ in range(2):
+            inputs = apply_to_tensors(lambda tensor: cast_fp_tensor(torch.bfloat16, tensor), inputs)
+            self.assertIs(inputs["packed_sequence_info"], info)
+            self.assertIs(info.materialize(torch.device("cpu"), 2), plan)
+            self.assertIs(info.interval(0, 8), view)
+            self.assertIs(view.documents, info.documents)
+        self.assertFalse(is_dataclass(info))
+        self.assertEqual(inputs["hidden_states"].dtype, torch.bfloat16)
+        self.assertEqual(plan.cu_seqlens.dtype, torch.int64)
+        self.assertEqual(info.local_offsets, (0, 1, 4))
+        inputs["hidden_states"].sum().backward()
+        torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
+
+    def test_metadata_remains_immutable_and_serializable(self):
+        """Boundary semantics survive serialization without allowing mutation."""
+        info = PackedSequenceInfo((0, 3, 8), 2, 6)
+        info.materialize(torch.device("cpu"), 2)
+        with self.assertRaises(FrozenInstanceError):
+            info.start = 0
+        with self.assertRaises(FrozenInstanceError):
+            del info.local_offsets
+        restored = pickle.loads(pickle.dumps(info))
+        self.assertEqual(restored, info)
+        self.assertEqual(hash(restored), hash(info))
+        self.assertEqual(restored.local_offsets, info.local_offsets)
+        torch.testing.assert_close(restored.materialize(torch.device("cpu"), 2).cu_seqlens,
+                                   info.materialize(torch.device("cpu"), 2).cu_seqlens)
 
     def test_global_offsets_survive_local_cuts_and_mutation(self):
         """Ulysses removes artificial CP cuts while retaining true sample starts."""

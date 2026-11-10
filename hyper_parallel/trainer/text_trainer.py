@@ -25,6 +25,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
+from hyper_parallel.trainer.runtime.dynamic_epoch import prepare_token_batch_step, uses_token_batch_loader
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
@@ -322,12 +323,19 @@ class TextTrainer:
         data_iterator = iter(train_dataloader) if train_dataloader is not None else None
         start_step = self.base.state.global_step - epoch * self.base.train_steps
         train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-        if balanced_loader:
+        token_loader = uses_token_batch_loader(self.base.config)
+        if balanced_loader or token_loader:
             start_step = 0
             train_steps = self.base.train_iters - self.base.state.global_step
         for _ in range(start_step, train_steps):
             try:
-                self.train_step(data_iterator)
+                step_iterator = data_iterator
+                if token_loader:
+                    step_iterator = prepare_token_batch_step(
+                        data_iterator, num_micro_batches=self.base.num_micro_batches,
+                        device=self.base.device, drop_last=self.base.config.dataloader.drop_last,
+                    )
+                self.train_step(step_iterator)
             except StopIteration:
                 if balanced_loader:
                     optimizers = self.base.optimizer
@@ -349,18 +357,19 @@ class TextTrainer:
                 self.base.state.global_step,
                 self.base.train_iters,
                 self.base.state.epoch,
-                self.base.train_epochs,
+                "until train_iters" if uses_token_batch_loader(self.base.config) else self.base.train_epochs,
             )
 
             train_dataloader = self.base.train_dataloader
             balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
             start_epoch = self.base.state.epoch
-            epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
+            source_epochs = balanced_loader or uses_token_batch_loader(self.base.config)
+            epochs = count(start_epoch) if source_epochs else range(start_epoch, self.base.train_epochs)
             for epoch in epochs:
                 if self.base.state.global_step >= self.base.train_iters:
                     break
                 # The first collective iterator may hold a restored checkpoint cursor.
-                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                if hasattr(train_dataloader, "set_epoch") and (not source_epochs or epoch != start_epoch):
                     train_dataloader.set_epoch(epoch)
 
                 self.base.state.epoch = epoch
@@ -368,11 +377,11 @@ class TextTrainer:
                 epoch_start_step = self.base.state.global_step
                 epoch_exhausted = self._train_epoch(epoch, balanced_loader)
 
-                if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
-                    raise ValueError("Indexed source epoch cannot provide one complete optimizer step")
+                if source_epochs and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                    raise ValueError("Source epoch cannot provide one complete distributed optimizer step")
 
                 self.on_epoch_end()
-                self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
+                self.base.state.epoch = epoch + 1 if not source_epochs or epoch_exhausted else epoch
                 print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
                 if self.base.state.global_step >= self.base.train_iters:
                     break

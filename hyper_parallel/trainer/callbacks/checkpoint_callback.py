@@ -39,6 +39,7 @@ from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
 from hyper_parallel.trainer.runtime.logging import create_logger
+from hyper_parallel.trainer.runtime.dynamic_epoch import uses_token_batch_loader
 from hyper_parallel.trainer.runtime.memory import empty_cache
 from hyper_parallel.trainer.runtime.device import (
     get_device_rng_state,
@@ -315,7 +316,7 @@ class CheckpointerCallback(Callback):
             },
         }
 
-    def _resume_position(self) -> Tuple[int, int]:
+    def _resume_position(self) -> Tuple[int, Optional[int]]:
         """Return the ``(epoch, step)`` position the training loop resumes from.
 
         Read off the same two values the loops use rather than re-derived from
@@ -328,8 +329,13 @@ class CheckpointerCallback(Callback):
 
         Returns:
             The epoch training resumes in, and its offset within that epoch.
+            The offset is None for token packing, which restores the loader cursor.
         """
         state = self.trainer.state
+        if uses_token_batch_loader(self.trainer.config):
+            # Dynamic epochs have no fixed step count; the saved loader cursor
+            # owns resume progress, and this offset is only used for logging.
+            return state.epoch, None
         return state.epoch, state.global_step - state.epoch * self.trainer.train_steps
 
     # ------------------------------------------------------------------

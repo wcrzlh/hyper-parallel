@@ -17,12 +17,12 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Any, Callable, Mapping, Sequence
 
-import torch
-from torch import nn
-from torch.nn import functional as F
+import torch  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.linear_attention_convolution import (
     fused_causal_conv1d, validate_conv_backend,
@@ -71,7 +71,6 @@ class PackedDocumentInfo:
         object.__setattr__(self, "offsets", offsets)
 
 
-@dataclass(frozen=True)
 class PackedSequenceInfo:
     """Own immutable sample offsets and a contiguous physical token interval.
 
@@ -79,40 +78,76 @@ class PackedSequenceInfo:
     padding sample. Local CP cuts are fragments, never new sample resets.
     Device plans contain read-only tensors; each invocation saves the tensors
     it consumes so that ordinary autograd version checks remain effective.
+
+    This is opaque runtime metadata, not a dataclass tensor container: input
+    precision conversion must preserve its identity and cached integer plans.
     """
 
-    global_offsets: tuple[int, ...] | PackedDocumentInfo
-    start: int
-    end: int
-    local_offsets: tuple[int, ...] = field(init=False)
-    documents: PackedDocumentInfo = field(init=False, repr=False, compare=False, hash=False)
-    _head_index: int = field(init=False, repr=False, compare=False, hash=False)
-    _tail_index: int = field(init=False, repr=False, compare=False, hash=False)
-    _plans: dict[tuple[torch.device, int], PackedChunkPlan] = field(
-        default_factory=dict, init=False, repr=False, compare=False, hash=False
-    )
-    _intervals: dict[tuple[int, int], PackedSequenceInfo] = field(
-        default_factory=dict, init=False, repr=False, compare=False, hash=False
+    __slots__ = (
+        "global_offsets", "start", "end", "local_offsets", "documents",
+        "_head_index", "_tail_index", "_plans", "_intervals",
     )
 
-    def __post_init__(self) -> None:
-        documents = (self.global_offsets if isinstance(self.global_offsets, PackedDocumentInfo)
-                     else PackedDocumentInfo(self.global_offsets))
+    global_offsets: tuple[int, ...]
+    start: int
+    end: int
+    local_offsets: tuple[int, ...]
+    documents: PackedDocumentInfo
+    _head_index: int
+    _tail_index: int
+    _plans: dict[tuple[torch.device, int], PackedChunkPlan]
+    _intervals: dict[tuple[int, int], PackedSequenceInfo]
+
+    def __init__(self, global_offsets: tuple[int, ...] | PackedDocumentInfo, start: int, end: int) -> None:
+        """Validate one physical interval and initialize its private plan caches."""
+        documents = (global_offsets if isinstance(global_offsets, PackedDocumentInfo)
+                     else PackedDocumentInfo(global_offsets))
         offsets = documents.offsets
         if (
-            not isinstance(self.start, int) or isinstance(self.start, bool)
-            or not isinstance(self.end, int) or isinstance(self.end, bool)
-            or not 0 <= self.start < self.end <= offsets[-1]
+            not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or not 0 <= start < end <= offsets[-1]
         ):
             raise ValueError("Packed token interval must be nonempty and covered by global sample offsets.")
-        head = bisect_right(offsets, self.start) - 1
-        tail = bisect_left(offsets, self.end) - 1
-        local = (0, *(value - self.start for value in offsets[head + 1:tail + 1]), self.end - self.start)
+        head = bisect_right(offsets, start) - 1
+        tail = bisect_left(offsets, end) - 1
+        local = (0, *(value - start for value in offsets[head + 1:tail + 1]), end - start)
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "end", end)
         object.__setattr__(self, "global_offsets", offsets)
         object.__setattr__(self, "local_offsets", local)
         object.__setattr__(self, "documents", documents)
         object.__setattr__(self, "_head_index", head)
         object.__setattr__(self, "_tail_index", tail)
+        object.__setattr__(self, "_plans", {})
+        object.__setattr__(self, "_intervals", {})
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep validated boundaries immutable while allowing private cache fills."""
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        """Prevent removing validated metadata fields."""
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare interval semantics independently of runtime caches."""
+        if type(other) is not type(self):
+            return NotImplemented
+        return (self.global_offsets, self.start, self.end) == (other.global_offsets, other.start, other.end)
+
+    def __hash__(self) -> int:
+        """Hash immutable interval semantics."""
+        return hash((self.global_offsets, self.start, self.end))
+
+    def __reduce__(self) -> tuple:
+        """Reconstruct metadata without serializing transient device plan caches."""
+        return type(self), (self.documents, self.start, self.end)
+
+    def __repr__(self) -> str:
+        """Describe boundaries without expanding device caches."""
+        return (f"PackedSequenceInfo(global_offsets={self.global_offsets!r}, start={self.start}, "
+                f"end={self.end}, local_offsets={self.local_offsets!r})")
 
     @property
     def length(self) -> int:

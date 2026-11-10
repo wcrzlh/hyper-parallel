@@ -308,10 +308,12 @@ class TextParallelBatch:
         if self.source_type == "packed_text":
             if not self.labels_are_shifted:
                 raise ValueError("Packed text batches require shifted labels; labels_are_shifted must be True")
-            if not create_attention_mask or (attention_mode == "compressed" and self.runtime_input_adapter is None):
+            if ((attention_mode == "dense" and not create_attention_mask)
+                    or (attention_mode == "compressed" and self.runtime_input_adapter is None)):
                 raise ValueError(
                     "Packed text batches require document-boundary attention: enable "
-                    "create_attention_mask_in_dataloader and supply a runtime_input_adapter for compressed attention"
+                    "create_attention_mask_in_dataloader for dense attention, or supply a "
+                    "runtime_input_adapter for compressed attention"
                 )
         if self.is_sft_dataset:
             if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:

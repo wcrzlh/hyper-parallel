@@ -18,13 +18,16 @@ import copy
 import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 from transformers import Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
 
 from hyper_parallel.components.losses import ChunkedCausalLMLoss, ModelOutputLoss
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import HuggingFaceCheckpointer
 from hyper_parallel.components.losses.mtp_objective import build_mtp_targets
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.models.qwen3_5_moe.adapter.mtp_data import QwenMTPRuntime
@@ -68,6 +71,28 @@ def make_structural_reference() -> Qwen3_5MoeForCausalLM:
 
 class TestMTPMigration(unittest.TestCase):
     """Validate real eager computation rather than mocked training success."""
+
+    def test_released_vlm_weights_load_into_text_mtp(self) -> None:
+        """Both pretrained readers load every backbone and MTP tensor through native renames."""
+        reference = make_model(1)
+        state = reference.state_dict()
+        for released_prefix in (False, True):
+            with self.subTest(released_prefix=released_prefix), tempfile.TemporaryDirectory() as directory:
+                checkpoint = {
+                    (name.replace("model.", "model.language_model.", 1)
+                     if released_prefix and name.startswith("model.") else name): tensor.clone().contiguous()
+                    for name, tensor in state.items()
+                }
+                save_file(checkpoint, str(Path(directory) / "model.safetensors"))
+                for loader in ("legacy", "dcp"):
+                    with self.subTest(loader=loader):
+                        model = make_model(1)
+                        with torch.no_grad():
+                            for parameter in model.parameters():
+                                parameter.zero_()
+                        HuggingFaceCheckpointer(loader=loader).load(directory, {"model": model})
+                        for name, actual in model.state_dict().items():
+                            torch.testing.assert_close(actual, state[name], rtol=0, atol=0, msg=name)
 
     @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_config_first_factory_consumes_pretrained_only_options(self) -> None:

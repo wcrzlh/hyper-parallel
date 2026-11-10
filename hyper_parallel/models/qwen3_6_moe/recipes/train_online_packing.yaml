@@ -202,7 +202,7 @@ checkpoint:
   is_async: false
   save_optimizer: true
   save_train_state: true
-  save_extra_state_per_rank: false
+  save_extra_state_per_rank: true
   restore_from: null
   restore_optimizer: true
   restore_train_state: true

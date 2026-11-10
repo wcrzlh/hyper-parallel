@@ -20,11 +20,15 @@ from __future__ import annotations
 # pylint: disable=forbidden-backend-import
 import copy
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeDecoderLayer,
     Qwen3_5MoeForCausalLM,
@@ -120,8 +124,19 @@ class Qwen3_5MoeMTP(nn.Module):
 class _QwenMTPModel:
     """Construct executable MTP structure before replacement and checkpoint loading."""
 
+    _hp_mtp_export_class: ClassVar[type]
+
     def __init__(self, config: Any) -> None:
         """Initialize the HF base through MRO, then its checkpoint-owned MTP layers."""
+        # HF does not inherit native conversion rules for custom subclasses.
+        # Register this model-owned class without changing native model mappings.
+        class_name = type(self).__name__
+        if get_checkpoint_conversion_mapping(class_name) is None:
+            native_class = self._hp_mtp_export_class
+            mapping = get_checkpoint_conversion_mapping(native_class.__name__)
+            if mapping is None:
+                mapping = get_checkpoint_conversion_mapping(config.model_type)
+            register_checkpoint_conversion_mapping(class_name, mapping or [])
         super().__init__(config)
         text_config = getattr(config, "text_config", config)
         reference = getattr(self, "get_input_embeddings")().weight
