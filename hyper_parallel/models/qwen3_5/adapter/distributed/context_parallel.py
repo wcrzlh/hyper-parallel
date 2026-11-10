@@ -150,7 +150,11 @@ def qwen3_5_packed_decoder_wrapper(
     """
     del mesh, tp_mesh, cp_mesh, ep_mesh
     required = ("linear_attn", "input_layernorm", "post_attention_layernorm", "mlp")
-    if getattr(target_module, "layer_type", None) != "linear_attention" or any(
+    # HF decoder versions use either discriminator; reject conflicting declarations.
+    decoder_types = {
+        getattr(target_module, name, None) for name in ("layer_type", "block_type")
+    } - {None}
+    if decoder_types != {"linear_attention"} or any(
         not hasattr(target_module, name) for name in required
     ):
         raise TypeError("Packed decoder wrapper requires a Qwen3.5 linear-attention decoder.")
@@ -185,8 +189,10 @@ def qwen3_5_packed_decoder_wrapper(
             raise RuntimeError("Install a packed local or CP GDN wrapper before the packed decoder wrapper.")
         residual = hidden_states
         hidden_states = target_module.input_layernorm(hidden_states)
+        # Packed boundaries reset both convolution and state; the full-attention
+        # pairwise mask is not a local two-dimensional GDN padding mask.
         hidden_states = target_module.linear_attn(
-            hidden_states=hidden_states, cache_params=None, attention_mask=attention_mask, **kwargs
+            hidden_states=hidden_states, cache_params=None, attention_mask=None, **kwargs
         )
         hidden_states = residual + hidden_states
         return hidden_states + target_module.mlp(target_module.post_attention_layernorm(hidden_states))
