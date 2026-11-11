@@ -30,6 +30,8 @@ export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
 
 NPROC=${NPROC:-16}
+# Select train_online_packing.yaml for packed documents, or train_online.yaml for Ulysses.
+CONFIG_FILE=${CONFIG_FILE:-${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_mla/recipes/train_online_p2p_kv_allgather.yaml}
 
 cd "${PROJECT_ROOT}"
 torchrun \
@@ -37,6 +39,6 @@ torchrun \
     --rdzv_id="${RDZV_ID}" \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-    --module examples.qwen3_8.train_text \
-    "${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_mla/recipes/train_online.yaml" \
+    --module scripts.train_lm \
+    "${CONFIG_FILE}" \
     "$@"

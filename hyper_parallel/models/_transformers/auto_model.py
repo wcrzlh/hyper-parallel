@@ -68,7 +68,6 @@ _CONFIG_ONLY_KWARGS = {
     "revision",
     "subfolder",
     "token",
-    "trust_remote_code",
     "use_auth_token",
 }
 
@@ -78,7 +77,7 @@ def _model_init_kwargs(
     *,
     load_base_model: bool,
 ) -> dict[str, Any]:
-    """Drop config/download-only kwargs when constructing directly from config."""
+    """Drop download kwargs, retaining trust_remote_code for HF class selection."""
     if load_base_model:
         return dict(kwargs)
     return {

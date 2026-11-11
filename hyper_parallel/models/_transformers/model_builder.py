@@ -179,6 +179,7 @@ def _init_model(
     # codegen sidecar: the gen backend bypasses the HF/custom dispatch
     # below; the native is_hf_model wiring stays as-is for everything else.
     if backend is ModelingBackend.GEN:
+        kwargs.pop("trust_remote_code", None)
         if codegen_artifact_dir is None:
             raise ValueError(
                 "the gen backend requires codegen_artifact_dir; "
@@ -280,6 +281,8 @@ def _init_model(
             **kwargs,
         )
     else:
+        # HF class selection is complete; native constructors do not accept this flag.
+        kwargs.pop("trust_remote_code", None)
         model = custom_model_cls.from_config(
             hf_config,
             *model_args,

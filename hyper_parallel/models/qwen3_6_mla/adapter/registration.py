@@ -35,10 +35,26 @@ def _load_context_parallel():
     return context_parallel
 
 
+def _load_sharding_rules():
+    """Classify MLA and GDN weights before generic planner template selection."""
+    from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole  # pylint: disable=C0415
+
+    return [
+        (["kv_a_proj.", "kv_down_proj."], ParamRole.REPLICATED),
+        (["kv_b_proj.", "kv_up_proj."], ParamRole.COLWISE),
+        ("in_proj_qkv", ParamRole.FUSED_QKV),
+        (["in_proj_z", "in_proj_b", "in_proj_a", "conv1d"], ParamRole.COLWISE),
+        (["A_log", "dt_bias"], ParamRole.COLWISE),
+        ("out_proj", ParamRole.ROWWISE),
+        ("shared_expert_gate", ParamRole.REPLICATED),
+    ]
+
+
 QWEN3_6_MLA_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_6MLAForCausalLM",
     model_type="qwen36_moe_mla",
     context_parallel=_load_context_parallel,
+    sharding_rules=_load_sharding_rules,
 )
 
 register_model_adapter(QWEN3_6_MLA_ADAPTER_SPEC)

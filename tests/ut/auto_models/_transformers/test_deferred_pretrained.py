@@ -14,13 +14,14 @@
 # ============================================================================
 """Avoid Transformers checkpoint reads before the finalized HF loading stage."""
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import BertConfig, BertForSequenceClassification
+from transformers import AutoModelForSequenceClassification, BertConfig, BertForSequenceClassification
 
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models._transformers.auto_model import (
@@ -53,6 +54,45 @@ def _make_check_callbacks(test_case, events, model, failed):
 
 class TestDeferredPretrained(unittest.TestCase):
     """Construct unquantized models from config for both finalized HF loaders."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_local_remote_architecture_survives_deferred_loading(self):
+        """Feature: trusted remote architecture selection during deferred loading.
+
+        Description: Load a local remote-code model with both legacy and DCP loaders.
+        Expectation: The remote class and every checkpoint tensor are preserved exactly.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source_file = Path(directory) / "modeling_remote.py"
+            source_file.write_text(
+                "from torch import nn\n"
+                "from transformers import BertForSequenceClassification\n\n"
+                "class RemoteBert(BertForSequenceClassification):\n"
+                "    def __init__(self, config):\n"
+                "        super().__init__(config)\n"
+                "        self.remote_projection = nn.Linear(config.hidden_size, 3, bias=False)\n",
+                encoding="utf-8",
+            )
+            config = BertConfig(vocab_size=16, hidden_size=8, num_hidden_layers=1,
+                                num_attention_heads=2, intermediate_size=16)
+            config.auto_map = {"AutoModelForSequenceClassification": "modeling_remote.RemoteBert"}
+            config._name_or_path = directory
+            source = AutoModelForSequenceClassification.from_config(config, trust_remote_code=True)
+            source.save_pretrained(directory)
+            for loader in ("legacy", "dcp"):
+                with self.subTest(loader=loader), \
+                        patch.dict(os.environ, {"HYPER_PARALLEL_HF_LOADER": loader}), \
+                        patch(_TARGET + "._current_device", return_value=torch.device("cpu")):
+                    model = HyperAutoModelForSequenceClassification.from_pretrained(
+                        directory, trust_remote_code=True, local_files_only=True, force_hf=True,
+                        torch_dtype=torch.float32, attn_implementation="eager",
+                    )
+                    self.assertEqual(type(model).__name__, "RemoteBert")
+                    self.assertEqual(model._hp_checkpoint_load_report.missing_keys, ())
+                    self.assertEqual(set(model.state_dict()), set(source.state_dict()))
+                    for name, expected in source.state_dict().items():
+                        torch.testing.assert_close(model.state_dict()[name], expected, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
