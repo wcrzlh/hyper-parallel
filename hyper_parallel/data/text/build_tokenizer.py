@@ -131,7 +131,10 @@ class _HFAutoTokenizer(_DatasetTokenizer):
 
     def __getattr__(self, name: str) -> Any:
         """Delegate tokenizer attributes to the wrapped Hugging Face tokenizer."""
-        return getattr(self.tokenizer, name)
+        # Unpickling probes attributes before restoring the instance dictionary.
+        # Raise AttributeError normally while the wrapped tokenizer is absent.
+        tokenizer = object.__getattribute__(self, "tokenizer")
+        return getattr(tokenizer, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Delegate runtime tokenizer options after the wrapped tokenizer exists."""

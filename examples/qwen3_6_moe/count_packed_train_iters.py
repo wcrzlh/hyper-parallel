@@ -15,6 +15,8 @@
 """Count finite text-packing epochs on CPU without loading model weights.
 
 Run: python -m examples.qwen3_6_moe.count_packed_train_iters recipe.yaml --world-size 8 --epochs 3
+Add --num-workers 8 to tokenize records in CPU worker processes. The default
+0 keeps serial execution; --worker-batch-size controls records per worker task.
 Dotted YAML overrides are accepted as in scripts.train_lm. The output reports
 complete synchronized optimizer steps and packs omitted by drop_last. No
 training checkpoint is read or modified. Tokenization must be deterministic;
@@ -25,9 +27,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+from torch.utils.data import DataLoader
 
 from hyper_parallel.data.batching import TokenBatchLoader, calculate_num_micro_batches
 from hyper_parallel.data.batching.build_collate_fn import build_online_text_collate_fn
@@ -53,7 +58,57 @@ class LengthDataset:
         return [{"input_ids": SimpleNamespace(shape=(length,))} for length in self.lengths[index]]
 
 
-def _build_lengths(config: Any) -> LengthDataset:
+class _TokenLengthDataset:
+    """Return only lengths from workers, retaining empty and multi-output records."""
+
+    def __init__(self, dataset: Any) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> list[int]:
+        return [int(sample["input_ids"].shape[-1]) for sample in self.dataset.get_item(index)]
+
+
+def _keep_length_rows(rows: list[list[int]]) -> list[list[int]]:
+    """Keep variable-sized per-record results instead of stacking them into tensors."""
+    return rows
+
+
+def _collect_lengths(dataset: Any, num_workers: int = 0, worker_batch_size: int = 64) -> LengthDataset:
+    """Tokenize with bounded prefetch and preserve the production source index order."""
+    if num_workers < 0 or worker_batch_size <= 0:
+        raise ValueError("num_workers must be nonnegative and worker_batch_size must be positive")
+    source = _TokenLengthDataset(dataset)
+    if num_workers:
+        # Preload imports in a clean server: workers share library pages without
+        # inheriting the parent's tokenizer threads or reopening every import.
+        method = "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
+        context = multiprocessing.get_context(method)
+        if method == "forkserver":
+            context.set_forkserver_preload([
+                "hyper_parallel.data.batching", "hyper_parallel.data.text",
+                "hyper_parallel.trainer.config.parser",
+            ])
+        batches = DataLoader(
+            source, batch_size=worker_batch_size, num_workers=num_workers,
+            shuffle=False, drop_last=False, collate_fn=_keep_length_rows,
+            multiprocessing_context=context, prefetch_factor=2,
+        )
+    else:
+        batches = ([source[index]] for index in range(len(source)))
+    lengths = []
+    next_progress = 1000
+    for rows in batches:
+        lengths.extend(rows)
+        if len(lengths) >= next_progress:
+            print(f"Tokenized {len(lengths)}/{len(source)} records", flush=True)
+            next_progress = (len(lengths) // 1000 + 1) * 1000
+    return LengthDataset(lengths)
+
+
+def _build_lengths(config: Any, num_workers: int = 0, worker_batch_size: int = 64) -> LengthDataset:
     assets = config.dataset.model_assets
     if assets.tokenizer is None:
         raise ValueError("The offline text counter requires a configured tokenizer.")
@@ -73,13 +128,7 @@ def _build_lengths(config: Any) -> LengthDataset:
     )
     if isinstance(dataset, tuple):
         dataset = dataset[0]
-    lengths = []
-    for index in range(len(dataset)):
-        samples = dataset.get_item(index)
-        lengths.append([int(sample["input_ids"].shape[-1]) for sample in samples])
-        if (index + 1) % 1000 == 0:
-            print(f"Tokenized {index + 1}/{len(dataset)} records", flush=True)
-    return LengthDataset(lengths)
+    return _collect_lengths(dataset, num_workers, worker_batch_size)
 
 
 def _selected_lengths(samples: list[dict[str, Any]]) -> tuple[int, int]:
@@ -135,10 +184,16 @@ def main() -> None:
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--start-epoch", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="CPU tokenization worker processes; 0 runs serially (default).")
+    parser.add_argument("--worker-batch-size", type=int, default=64,
+                        help="Source records per worker task (default: 64); does not change training batches.")
     parser.add_argument("--output", type=Path)
     args, overrides = parser.parse_known_args()
     if args.world_size <= 0 or args.epochs <= 0 or args.start_epoch < 0:
         parser.error("world-size and epochs must be positive, start-epoch must be nonnegative")
+    if args.num_workers < 0 or args.worker_batch_size <= 0:
+        parser.error("num-workers must be nonnegative and worker-batch-size must be positive")
     config = load_training_config(args.config, overrides)
     if (config.dataset.target.callable is not build_online_text_mapping_dataset
             or config.dataloader.target.callable is not TokenBatchLoader
@@ -149,7 +204,7 @@ def main() -> None:
     if args.world_size % model_parallel:
         raise ValueError("world-size must be divisible by TP * CP * PP; EP does not divide the data-parallel degree.")
     dp_size = args.world_size // model_parallel
-    lengths = _build_lengths(config)
+    lengths = _build_lengths(config, args.num_workers, args.worker_batch_size)
     epochs = [count_epoch(config, lengths, dp_size, epoch)
               for epoch in range(args.start_epoch, args.start_epoch + args.epochs)]
     report = {
