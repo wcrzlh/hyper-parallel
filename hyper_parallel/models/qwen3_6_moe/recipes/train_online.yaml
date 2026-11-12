@@ -42,7 +42,10 @@ fsdp_config:
   # The eight-rank expert domain becomes EDP=4 x EP=2. Shard each EP
   # partition across all four EDP ranks, leaving no replicated EDP axis.
   edp_shard_size: 4
-  replicate_params: []
+  # Tiny GDN parameters stay replicated to avoid per-parameter all-gathers.
+  replicate_params:
+    - "*.linear_attn.A_log"
+    - "*.linear_attn.dt_bias"
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true

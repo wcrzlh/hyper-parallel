@@ -106,20 +106,22 @@ class FSDP2Manager:
         self,
         model: ModuleClass,
     ) -> set[ParameterClass] | None:
-        """Resolve configured replicate-parameter FQNs on the final model."""
+        """Resolve replicate-parameter FQNs or glob patterns on the final model."""
         if not self.config.replicate_params:
             return None
 
         parameters_by_fqn = dict(model.named_parameters(remove_duplicate=False))
         replicate_params = set()
         for parameter_fqn in self.config.replicate_params:
-            parameter = parameters_by_fqn.get(parameter_fqn)
-            if parameter is None:
+            matched_fqns = [parameter_fqn] if parameter_fqn in parameters_by_fqn else [
+                fqn for fqn in parameters_by_fqn if fnmatch.fnmatchcase(fqn, parameter_fqn)
+            ]
+            if not matched_fqns:
                 raise ValueError(
-                    "replicate_params contains unknown parameter FQN: "
+                    "replicate_params matches no parameter FQN: "
                     f"{parameter_fqn}"
                 )
-            replicate_params.add(parameter)
+            replicate_params.update(parameters_by_fqn[fqn] for fqn in matched_fqns)
         return replicate_params
 
     def _build_expert_fsdp_mesh(self) -> DeviceMesh:

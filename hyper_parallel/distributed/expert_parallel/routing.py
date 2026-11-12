@@ -32,11 +32,13 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 import logging
 import math
 import os
+from collections.abc import Callable
 from typing import Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
+RouterAdapter = Callable[[torch.nn.Module, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 
 # float32 represents every integer up to 2**24 exactly, so a smaller expert count
 # can use the AICore float sort (see ``experts._SORT_KEY_FP32_LIMIT``).
@@ -301,7 +303,7 @@ def _expert_score_order(
     fractional part carries the inverted, normalized weight, so a heavier slot always sorts
     earlier and the fraction can never carry into the next expert.  One key also means one sort
     -- the AICore float sort the expert-major order already uses.  A lexicographic or int64 key
-    would lose that kernel (the same reason ``HP_EP_SORT_FP32`` exists for the dispatch sort),
+    would lose that kernel (dispatch sorting also converts eligible integer keys to FP32),
     and a second pass is not needed either.
 
     Resolution limit: fp32 spends the integer part's exponent on the expert index, so the
@@ -352,8 +354,7 @@ def _expert_score_order(
 def _expert_major_order(flat_expert: "torch.Tensor", num_experts: int) -> "torch.Tensor":
     """Return the permutation that groups slots by expert.
 
-    Integer ``argsort`` has no AICore kernel on this stack (the same reason
-    ``HP_EP_SORT_FP32`` exists for the dispatch sort), so keys are cast to float32 when the
+    Integer ``argsort`` has no AICore kernel on this stack, so keys are cast to float32 when the
     expert count is exactly representable.  Ties inside one expert may then be ordered
     arbitrarily rather than by token: the *count* kept per expert -- which is what bounds the
     busiest rank's memory -- is unaffected, and the result is still deterministic for a given
@@ -437,7 +438,7 @@ def _balanced_expert_indices(
     return indices.view(token_count, experts_per_token)
 
 
-def make_balanced_router(real_router):
+def make_balanced_router(real_router: RouterAdapter) -> RouterAdapter:
     """Wrap ``real_router`` in a benchmark-only variant with a uniform expert load.
 
     The real adapter still runs -- so its weights stay differentiable and the
@@ -476,7 +477,7 @@ def make_balanced_router(real_router):
         destination load; its ``__name__`` records the wrapped adapter.
     """
 
-    def balanced_router(module, hidden_states):
+    def balanced_router(module: torch.nn.Module, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Run ``real_router`` and replace its destinations round-robin."""
         topk_idx, topk_w = real_router(module, hidden_states)
         token_count, experts_per_token = topk_idx.shape
@@ -534,7 +535,7 @@ for _alias, _adapter in list(MOE_ROUTER_ADAPTERS.items()):
 del _alias, _adapter
 
 
-def resolve_moe_router(router, fix_router: bool = False):
+def resolve_moe_router(router: str | RouterAdapter, fix_router: bool = False) -> RouterAdapter:
     """Resolve a router adapter, optionally to its benchmark-only balanced variant.
 
     ``fix_router`` is the switch every archetype factory exposes; it has to mean the

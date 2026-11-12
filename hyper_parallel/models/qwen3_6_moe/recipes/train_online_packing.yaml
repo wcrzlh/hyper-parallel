@@ -43,7 +43,10 @@ fsdp_config:
     reduce_dtype: float32
     output_dtype: bfloat16
   edp_shard_size: 4
-  replicate_params: []
+  # Tiny GDN parameters stay replicated to avoid per-parameter all-gathers.
+  replicate_params:
+    - "*.linear_attn.A_log"
+    - "*.linear_attn.dt_bias"
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
@@ -146,7 +149,7 @@ dataset:
   data_config:
     dataset_type: mapping
     hf_dataset_name: null
-    create_attention_mask_in_dataloader: true
+    create_attention_mask_in_dataloader: false
     labels_are_shifted: true
 
 dataloader:

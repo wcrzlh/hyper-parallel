@@ -122,14 +122,9 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
-# ``ArgSort`` has no int32/int64 AICore kernel and silently falls back to
-# AI_CPU (runtime warning), which is expensive on the EP dispatch path where it
-# sits before the all-to-all.  Every key sorted here is a small non-negative
-# integer and float32 represents integers up to 2**24 exactly, so sorting a
-# float32 key preserves the order and lets the kernel run on AICore.  Opt-in
-# while it is being measured (HP_EP_SORT_FP32=1).
+# NPU integer ArgSort falls back to AI CPU. FP32 represents small integer keys
+# exactly and permits AI Core sorting without changing expert group membership.
 _SORT_KEY_FP32_LIMIT = 2 ** 24
-_SORT_FP32_ENABLED = os.environ.get("HP_EP_SORT_FP32", "0") == "1"
 
 # The routed dispatch issues two ragged all-to-all exchanges per pass (hidden
 # states, then expert indices) whose token counts are identical and whose
@@ -186,9 +181,10 @@ def _argsort_keys(keys: torch.Tensor, *, bound: int) -> torch.Tensor:
             caller so no device sync is needed to check the float32 range.
 
     Returns:
-        The int64 permutation that sorts ``keys``.
+        The int64 permutation that sorts ``keys``. Equal keys need not retain
+        their original order, as with the default unstable integer argsort.
     """
-    if _SORT_FP32_ENABLED and 0 < bound <= _SORT_KEY_FP32_LIMIT:
+    if keys.device.type == "npu" and 0 < bound <= _SORT_KEY_FP32_LIMIT:
         return keys.to(torch.float32).argsort()
     return keys.argsort()
 

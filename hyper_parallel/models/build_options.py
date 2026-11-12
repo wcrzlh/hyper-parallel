@@ -242,6 +242,8 @@ class FSDP2Config:
     either mode.
 
     ``reshard_after_forward`` also controls the remaining root parameters.
+    ``replicate_params`` selects exact parameter FQNs or glob patterns to keep
+    replicated with DDP-style gradient synchronization. Unmatched entries fail.
     """
     dp_shard_size: int = 1
     edp_shard_size: int = 1

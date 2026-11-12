@@ -53,6 +53,46 @@ class TestFSDPCustomPrecisionConfig(unittest.TestCase):
         clear_device_mesh_cache()
         self.addCleanup(clear_device_mesh_cache)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_replicate_patterns_select_only_gdn_scalars_at_both_depths(self):
+        """Packing patterns select GDN scalars at 20/40 layers and deduplicate aliases."""
+        for depth in (20, 40):
+            with self.subTest(depth=depth):
+                model = nn.Module()
+                model.model = nn.Module()
+                model.model.layers = nn.ModuleList([nn.Module() for _ in range(depth)])
+                expected = set()
+                for index, layer in enumerate(model.model.layers):
+                    layer.proj = nn.Linear(4, 4)
+                    if index % 4 != 3:
+                        layer.linear_attn = nn.Module()
+                        layer.linear_attn.A_log = nn.Parameter(torch.ones(32))
+                        layer.linear_attn.dt_bias = nn.Parameter(torch.zeros(32))
+                        expected.update((layer.linear_attn.A_log, layer.linear_attn.dt_bias))
+                model.alias = model.model.layers[0].linear_attn.A_log
+                config = FSDP2Config(replicate_params=[
+                    "*.linear_attn.A_log", "*.linear_attn.dt_bias",
+                    "model.layers.0.linear_attn.A_log", "alias",
+                ])
+                manager = FSDP2Manager(config, MeshContext())
+
+                selected = manager._resolve_replicate_params(model)  # pylint: disable=protected-access
+
+                self.assertEqual(selected, expected)
+                self.assertEqual(len(selected), depth * 3 // 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_replicate_patterns_reject_unmatched_entries(self):
+        """Misspelled exact names and patterns must not silently disable replication."""
+        model = _DecoderModel()
+        for selector in ("layers.9.bias", "*.linear_attn.typo"):
+            with self.subTest(selector=selector):
+                manager = FSDP2Manager(FSDP2Config(replicate_params=[selector]), MeshContext())
+                with self.assertRaisesRegex(ValueError, "replicate_params matches no parameter FQN"):
+                    manager._resolve_replicate_params(model)  # pylint: disable=protected-access
+
     def test_graph_unit_bindings_follow_actual_inner_parameter_claims(self):
         """Dry unit binding excludes inner/ignored identities without installing hooks."""
         model = _DecoderModel()
