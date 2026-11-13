@@ -30,6 +30,8 @@ from hyper_parallel.data.batching.dynamic_batch import (
     FullSampleCheckpoint,
     IndexReplayCheckpoint,
     MappingReplayDataset,
+    StepBatchGrouper,
+    StepCandidateBuffer,
     _BatchPipeline,
     _OmniPackingPipeline,
     _TokenBatchPipeline,
@@ -54,13 +56,16 @@ def calculate_num_micro_batches(
         global_batch_size: int,
         micro_batch_size: int,
         dp_world_size: int,
+        *,
+        step_packing: bool = False,
 ) -> int:
     """Calculate the number of micro-batches in one optimizer step.
 
     Args:
         global_batch_size: Number of samples processed by one optimizer step.
-        micro_batch_size: Number of samples processed by each DP rank and forward pass.
+        micro_batch_size: Original number of source samples per DP micro-batch.
         dp_world_size: Number of data-parallel ranks.
+        step_packing: Pack the original source micro-batches into one computation.
 
     Returns:
         Number of forward/backward micro-batches executed by each DP rank.
@@ -68,6 +73,14 @@ def calculate_num_micro_batches(
     Raises:
         ValueError: If the global batch cannot be divided exactly.
     """
+    if not isinstance(step_packing, bool):
+        raise ValueError("step_packing must be a boolean")
+
+    for name, value in (("global_batch_size", global_batch_size),
+                        ("micro_batch_size", micro_batch_size), ("dp_world_size", dp_world_size)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
     distributed_micro_batch_size = micro_batch_size * dp_world_size
     if global_batch_size % distributed_micro_batch_size != 0:
         raise ValueError(
@@ -75,7 +88,7 @@ def calculate_num_micro_batches(
             f"micro_batch_size * dp_world_size ({distributed_micro_batch_size})"
         )
 
-    num_micro_batches = global_batch_size // distributed_micro_batch_size
+    num_micro_batches = 1 if step_packing else global_batch_size // distributed_micro_batch_size
     logger.debug(
         "Resolved micro-batches=%d from global_batch_size=%d, micro_batch_size=%d, dp_world_size=%d",
         num_micro_batches,
@@ -361,6 +374,21 @@ def build_dataloader(
     sampler_type = getattr(dataloader_target, "sampler_type", "single")
     data_config = data_config or {}
     load_balance = _resolve_load_balance(dataloader_target, data_config)
+    step_packing_options = {}
+    if getattr(dataloader_target, "step_packing", False):
+        loader_target = getattr(dataloader_target, "target", dataloader_target)
+        target_callable = getattr(loader_target, "callable", None)
+        if not isinstance(target_callable, type) or not issubclass(
+                target_callable, (FixedBatchDataLoader, _DynamicBatchLoader)):
+            raise ValueError("step_packing requires FixedBatchDataLoader, TokenBatchLoader or OmniPackingLoader")
+
+        if load_balance is not None:
+            raise ValueError("step_packing cannot be combined with dataloader.load_balance")
+
+        if getattr(mesh_context, "pp_size", 1) != 1:
+            raise ValueError("step_packing currently requires pp_size=1")
+
+        step_packing_options["global_batch_size"] = training_config.global_batch_size
 
     dataloaders: list[Any | None] = [None] * len(datasets)
     batch_samplers: list[Any | None] = [None] * len(datasets)
@@ -383,6 +411,7 @@ def build_dataloader(
                 dataset=dataset, collate_fn=collate_fn, batch_sampler=batch_sampler,
                 batch_size=micro_batch_size, sampler_type=sampler_type,
                 dp_world_size=dp_world_size, max_seq_len=max_seq_len, seed=seed,
+                **step_packing_options,
             )
         logger.debug(
             "Built DataLoader split=%s, dataset=%s, batch_sampler=%s",
@@ -399,7 +428,12 @@ def build_dataloader(
 
 
 class FixedBatchDataLoader(StatefulDataLoader):
-    """Build fixed-sample batches while retaining Trainer iterator policy."""
+    """Build fixed-sample batches, optionally packing one original optimizer step.
+
+    ``step_packing`` retains the source sampler and collates all its local
+    micro-batches together. The supplied collator must support packing with
+    variable token lengths. Checkpoint only after consuming a complete step.
+    """
 
     def __init__(
             self,
@@ -414,10 +448,39 @@ class FixedBatchDataLoader(StatefulDataLoader):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            step_packing: bool = False,
+            global_batch_size: int | None = None,
+            dp_world_size: int = 1,
     ) -> None:
         """Initialize the stateful DataLoader."""
         if sampler_type not in ("single", "cyclic"):
             raise ValueError("sampler_type must be 'single' or 'cyclic'")
+
+        if not isinstance(step_packing, bool):
+            raise ValueError("step_packing must be a boolean")
+
+        self.step_packing = step_packing
+        self.step_grouper = None
+        self.packing_collate_fn = collate_fn
+        if step_packing:
+            if not drop_last:
+                raise ValueError("step_packing requires drop_last=True for complete optimizer steps")
+            if collate_fn is None or getattr(collate_fn, "pad_to_length", None) is not None:
+                raise ValueError("step_packing requires a packing collator with pad_to_length=None")
+            source_batch_size = getattr(batch_sampler, "micro_batch_size", batch_size)
+            source_dp_size = getattr(batch_sampler, "dp_world_size", dp_world_size)
+            source_global_batch = getattr(batch_sampler, "global_batch_size", global_batch_size)
+            if source_dp_size != dp_world_size or source_global_batch != global_batch_size:
+                raise ValueError("step_packing batch sizes must match the source batch sampler")
+            if batch_size is not None and source_batch_size != batch_size:
+                raise ValueError("step_packing batch_size must match batch_sampler.micro_batch_size")
+            self.step_grouper = StepBatchGrouper(
+                calculate_num_micro_batches(source_global_batch, source_batch_size, source_dp_size),
+                source_batch_size,
+            )
+            if callable(getattr(batch_sampler, "enable_source_batch_resume", None)):
+                batch_sampler.enable_source_batch_resume()
+            collate_fn = list
 
         self.drop_last = drop_last
         self.sampler_type = sampler_type
@@ -446,6 +509,52 @@ class FixedBatchDataLoader(StatefulDataLoader):
                 **worker_options,
             )
 
+    def __iter__(self) -> Iterator[Any]:
+        """Collate each complete local step once when step packing is enabled."""
+        source_iterator = super().__iter__()
+        if not self.step_packing:
+            return source_iterator
+        return self._step_data_generator(source_iterator)
+
+    def _step_data_generator(self, source_iterator: Iterator[list[Any]]) -> Iterator[Mapping[str, Any]]:
+        """Group original source micro-batches before applying the existing collator."""
+        for samples in self.step_grouper.groups(source_iterator):
+            batch = self.packing_collate_fn(samples)
+            input_ids = batch.get("input_ids")
+            if (not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2
+                    or input_ids.shape[0] != 1 or "cu_seq_lens" not in batch):
+                raise ValueError("step_packing requires a packing collator producing [1, tokens] and cu_seq_lens")
+            logger.debug(
+                "Step packing: source_samples=%d source_micro_batches=%d packed_tokens=%d",
+                len(samples), self.step_grouper.source_batches_per_step, input_ids.shape[-1], enabled=True,
+            )
+            yield batch
+
+    def __len__(self) -> int:
+        """Report complete packed steps or the original fixed micro-batch count."""
+        source_batches = super().__len__()
+        if self.step_packing:
+            return source_batches // self.step_grouper.source_batches_per_step
+        return source_batches
+
+    def state_dict(self) -> dict[str, Any]:
+        """Retain the source cursor and validate packing dimensions on resume."""
+        state = super().state_dict()
+        if self.step_packing:
+            state.update(step_packing=True, source_batches_per_step=self.step_grouper.source_batches_per_step)
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore a source cursor saved at a complete optimizer-step boundary."""
+        if state_dict.get("step_packing", False) != self.step_packing:
+            raise ValueError("DataLoader resume requires an unchanged step_packing mode")
+        if (self.step_packing
+                and state_dict.get("source_batches_per_step") != self.step_grouper.source_batches_per_step):
+            raise ValueError("step_packing resume requires unchanged source batches per step")
+        source_state = {key: value for key, value in state_dict.items()
+                        if key not in ("step_packing", "source_batches_per_step")}
+        super().load_state_dict(source_state)
+
     def set_epoch(self, epoch: int) -> None:
         """Forward epoch state to the Dataset and configured batch sampler.
 
@@ -471,22 +580,31 @@ class _DynamicBatchLoader(ABC):
         dataset: Online mapping or iterable Dataset producing ModelSamples.
         batch_sampler: Optional mapping-style batch sampler.
         collate_fn: Final batch collator receiving the selected ModelSamples.
-        batch_size: Configured micro batch size used to derive the token budget.
+        batch_size: Original source micro-batch size; also derives the token budget
+            when step packing is disabled. Step packing never changes the sampler's value.
         dp_world_size: Number of data-parallel source lanes.
         save_by_idx: Whether to checkpoint buffer entries as output indices.
             Mapping Datasets default to true and iterable Datasets default to false.
         max_seq_len: Maximum sample length used to derive the token budget.
+            Not required for step packing, which does not select by token count.
         token_budget: Optional candidate-selection budget. Values smaller than
             one sample still emit that sample alone instead of truncating it.
         min_buffered_samples: Minimum candidate samples buffered before batching.
         drop_last: Compatibility option retained from fixed DataLoader configuration.
-            Dynamic buffers are always drained when the source is exhausted.
+            Token-budget buffers are always drained when the source is exhausted.
         sampler_type: Whether each Dataset epoch reuses one order or advances
             the deterministic cyclic order.
         num_workers: Number of source DataLoader workers.
         seed: Source DataLoader random seed.
         pin_memory: Whether source samples use pinned host memory.
         prefetch_factor: Number of source batches prefetched by each worker.
+        step_packing: Pack all local samples of an optimizer step together.
+            Retains the original BatchSampler and ignores token-budget selection.
+            Requires drop_last=True and an unfixed packing collator; packed
+            batches may differ in length between DP ranks. Checkpoints must be
+            taken at yielded step boundaries. Pipeline parallelism and
+            distributed load balancing are not supported in this mode.
+        global_batch_size: Original global sample count, required for step packing.
     """
 
     def __init__(
@@ -507,15 +625,18 @@ class _DynamicBatchLoader(ABC):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            step_packing: bool = False,
+            global_batch_size: int | None = None,
     ) -> None:
         """Initialize source reading, token selection, and Online packing."""
         # pylint: disable=too-many-locals
         if collate_fn is None:
             raise ValueError(f"{type(self).__name__} requires a collate_fn")
 
-        if max_seq_len is None:
+        if max_seq_len is None and not step_packing:
             raise ValueError(f"{type(self).__name__} requires data_transform.max_seq_len")
-        if token_budget is not None and token_budget <= 0:
+
+        if not step_packing and token_budget is not None and token_budget <= 0:
             raise ValueError("token_budget must be positive")
 
         resolved_dp_world_size = dp_world_size
@@ -529,14 +650,41 @@ class _DynamicBatchLoader(ABC):
         self.drop_last = drop_last
         self.batch_collate_fn = collate_fn
         self.dp_world_size = resolved_dp_world_size
+        self.step_packing = step_packing
+        self.step_grouper = None
+        if not isinstance(step_packing, bool):
+            raise ValueError("step_packing must be a boolean")
+
+        if step_packing:
+            if not drop_last:
+                raise ValueError("step_packing requires drop_last=True for complete optimizer steps")
+
+            if getattr(collate_fn, "pad_to_length", None) is not None:
+                raise ValueError("step_packing requires collate_fn.pad_to_length=None; use alignment_size instead")
+
+            if getattr(batch_sampler, "micro_batch_size", batch_size) != batch_size:
+                raise ValueError("step_packing requires batch_size to match batch_sampler.micro_batch_size")
+
+            if getattr(batch_sampler, "global_batch_size", global_batch_size) != global_batch_size:
+                raise ValueError("step_packing requires global_batch_size to match the batch_sampler")
+
+            source_batch_size = batch_size if batch_sampler is not None else 1
+            self.step_grouper = StepBatchGrouper(
+                calculate_num_micro_batches(global_batch_size, source_batch_size, resolved_dp_world_size),
+                source_batch_size,
+            )
 
         # build_candidate_buffer
         self._batch_pipeline = self._build_batch_pipeline(dataset)
-        resolved_token_budget = batch_size * max_seq_len if token_budget is None else token_budget
-        self.candidate_buffer = self._batch_pipeline.build_candidate_buffer(
-            token_budget=resolved_token_budget,
-            min_buffered_samples=min_buffered_samples,
-        )
+        # Both selection modes reuse the checkpoint adapter and encoding pipeline.
+        if step_packing:
+            self.candidate_buffer = StepCandidateBuffer(token_budget=1, min_buffered_samples=1)
+        else:
+            resolved_token_budget = batch_size * max_seq_len if token_budget is None else token_budget
+            self.candidate_buffer = self._batch_pipeline.build_candidate_buffer(
+                token_budget=resolved_token_budget,
+                min_buffered_samples=min_buffered_samples,
+            )
         if batch_sampler is not None:
             enable_source_resume = getattr(batch_sampler, "enable_source_batch_resume", None)
             if callable(enable_source_resume):
@@ -596,10 +744,31 @@ class _DynamicBatchLoader(ABC):
             self.candidate_buffer.buffer_token_count = 0
 
         source_iterator = iter(self.source_dataloader)
-        batch_iterator = self._batch_data_generator(source_iterator)
+        if self.step_packing:
+            batch_iterator = self._step_data_generator(source_iterator)
+        else:
+            batch_iterator = self._batch_data_generator(source_iterator)
+
         self.resume_pending = False
 
         return batch_iterator
+
+    def _step_data_generator(self, source_iterator: Iterator[list[Any]]) -> Iterator[Mapping[str, Any]]:
+        """Finalize and pack complete source steps without budget selection."""
+        for source_samples in self.step_grouper.groups(source_iterator):
+            for source_sample in source_samples:
+                self._buffer_checkpoint.put_source_item(source_sample, self.candidate_buffer)
+            batch = self._build_micro_batch()
+            input_ids = batch.get("input_ids")
+            if (not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2
+                    or input_ids.shape[0] != 1 or "cu_seq_lens" not in batch):
+                raise ValueError("step_packing requires a packing collator producing [1, tokens] and cu_seq_lens")
+
+            logger.debug(
+                "Step packing: source_samples=%d source_micro_batches=%d packed_tokens=%d",
+                len(source_samples), self.step_grouper.source_batches_per_step, input_ids.shape[-1], enabled=True,
+            )
+            yield batch
 
     def _batch_data_generator(
             self,
@@ -658,6 +827,8 @@ class _DynamicBatchLoader(ABC):
             "buffer": self._buffer_checkpoint.get_buffer_state(self.candidate_buffer),
             "buffer_token_count": self.candidate_buffer.buffer_token_count,
         }
+        if self.step_packing:
+            state.update(step_packing=True, source_batches_per_step=self.step_grouper.source_batches_per_step)
         checkpoint_state = copy.deepcopy(state)
 
         return checkpoint_state
@@ -669,6 +840,13 @@ class _DynamicBatchLoader(ABC):
             state_dict: Saved source progress and unconsumed candidate buffer.
         """
         checkpoint_state = copy.deepcopy(dict(state_dict))
+        if checkpoint_state.get("step_packing", False) != self.step_packing:
+            raise ValueError("DataLoader resume requires an unchanged step_packing mode")
+
+        saved_source_batches = checkpoint_state.get("source_batches_per_step")
+        if self.step_packing and saved_source_batches != self.step_grouper.source_batches_per_step:
+            raise ValueError("step_packing resume requires unchanged source batches per step")
+
         saved_dp_world_size = checkpoint_state.get("dp_world_size", self.dp_world_size)
         if saved_dp_world_size != self.dp_world_size:
             raise ValueError(
