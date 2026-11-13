@@ -25,7 +25,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
-from hyper_parallel.trainer.runtime.dynamic_epoch import prepare_token_batch_step, uses_token_batch_loader
+from hyper_parallel.trainer.runtime.dynamic_epoch import prepare_token_batch_step, uses_source_epoch
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
@@ -143,6 +143,7 @@ class TextTrainer:
             global_batch_size=training_config.global_batch_size,
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
+            step_packing=getattr(dataloader_config, "step_packing", False),
         )
         self.base.collate_fn = dataloader_config.collate_fn.build(
             mesh_context=self.base.mesh,
@@ -323,7 +324,7 @@ class TextTrainer:
         data_iterator = iter(train_dataloader) if train_dataloader is not None else None
         start_step = self.base.state.global_step - epoch * self.base.train_steps
         train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-        token_loader = uses_token_batch_loader(self.base.config)
+        token_loader = uses_source_epoch(self.base.config)
         if balanced_loader or token_loader:
             start_step = 0
             train_steps = self.base.train_iters - self.base.state.global_step
@@ -357,13 +358,13 @@ class TextTrainer:
                 self.base.state.global_step,
                 self.base.train_iters,
                 self.base.state.epoch,
-                "until train_iters" if uses_token_batch_loader(self.base.config) else self.base.train_epochs,
+                "until train_iters" if uses_source_epoch(self.base.config) else self.base.train_epochs,
             )
 
             train_dataloader = self.base.train_dataloader
             balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
             start_epoch = self.base.state.epoch
-            source_epochs = balanced_loader or uses_token_batch_loader(self.base.config)
+            source_epochs = balanced_loader or uses_source_epoch(self.base.config)
             epochs = count(start_epoch) if source_epochs else range(start_epoch, self.base.train_epochs)
             for epoch in epochs:
                 if self.base.state.global_step >= self.base.train_iters:
