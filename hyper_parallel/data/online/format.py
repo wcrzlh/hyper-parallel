@@ -20,7 +20,10 @@ message field mapping. Model transforms own chat templates, media encoding,
 labels, and training constraints.
 """
 
+from __future__ import annotations
+
 import copy
+import json
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -40,6 +43,41 @@ _SHAREGPT_ROLE_MAP = {
     "model": "assistant",
     "bot": "assistant",
 }
+
+
+def normalize_tools(tools: Any, tools_key: str) -> list[dict[str, Any]] | None:
+    """Normalize per-sample tool definitions for text and processor templates.
+
+    Args:
+        tools: A sequence of mappings, its JSON representation, or an empty value.
+        tools_key: Source field name used in validation errors.
+
+    Returns:
+        Tool dictionaries, or None for missing, false, or empty definitions.
+
+    Raises:
+        ValueError: If JSON is invalid or definitions are not a sequence of mappings.
+    """
+    if tools is None or tools is False:
+        return None
+    if isinstance(tools, str):
+        if not tools:
+            return None
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Tools field {tools_key!r} must contain valid JSON") from exc
+        if tools is None or tools is False:
+            return None
+    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
+        raise ValueError(f"Tools field {tools_key!r} must be a sequence of mappings")
+
+    normalized_tools = []
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            raise ValueError(f"Every entry in tools field {tools_key!r} must be a mapping")
+        normalized_tools.append(dict(tool))
+    return normalized_tools or None
 
 
 def normalize_conversation(messages: Any) -> list[dict[str, Any]]:

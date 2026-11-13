@@ -14,6 +14,7 @@
 # ============================================================================
 """Model-owned forward installation for Qwen dense and MoE VLM CP."""
 
+from contextlib import nullcontext
 from functools import partial, wraps
 from typing import Any
 
@@ -24,6 +25,10 @@ from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature
 from hyper_parallel.models import HyperAutoModelForImageTextToText
 from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMCPInputs
 from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
+from hyper_parallel.models.qwen3_5_moe.adapter.dummy_vision import (
+    install_dummy_vision_forward,
+    vision_already_encoded,
+)
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import _chunk_loss_forward
 from hyper_parallel.models.qwen3_5_moe.adapter.mtp_runtime import mtp_forward
 
@@ -83,6 +88,7 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
         raise ValueError("Qwen VLM CP forward is already installed")
     original_forward = model.forward
     bridge = QwenVisionBridge(model)
+    install_dummy_vision_forward(model)
 
     @wraps(original_forward)
     def forward(*args: Any, **kwargs: Any) -> Any:
@@ -137,11 +143,12 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
         elif chunked:
             # Use the VLM loss adapter directly so either binding order is safe.
             forward_impl = partial(_chunk_loss_forward, model)
-        output = forward_impl(
-            input_ids=None, inputs_embeds=hidden,
-            position_ids=positions[..., geometry.start:geometry.stop].contiguous(),
-            attention_mask={"full_attention": None, "linear_attention": None}, **kwargs,
-        )
+        with vision_already_encoded() if images or plan is not None else nullcontext():
+            output = forward_impl(
+                input_ids=None, inputs_embeds=hidden,
+                position_ids=positions[..., geometry.start:geometry.stop].contiguous(),
+                attention_mask={"full_attention": None, "linear_attention": None}, **kwargs,
+            )
         if chunked:
             if anchor is not None:
                 output.loss_sum = output.loss_sum + anchor

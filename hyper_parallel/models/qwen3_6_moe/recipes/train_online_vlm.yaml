@@ -4,7 +4,7 @@
 # bash examples/qwen3_6_moe/launch_vlm_1node_8dies.sh
 model:
   _target_: hyper_parallel.models.qwen3_5_moe.adapter.vlm.build_qwen_vlm
-  pretrained_model_name_or_path: path/to/model_weights
+  pretrained_model_name_or_path: /path/to/model
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
@@ -93,17 +93,18 @@ dataset:
   training_mode: sft
   model_assets:
     _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
-    pretrained_model_name_or_path: path/to/model_weights
+    pretrained_model_name_or_path: /path/to/model
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   # JSON/JSONL messages with image paths, or Parquet messages + images[].bytes/path.
-  data_path: /home/chaoran/datasets/llava_1k_en/messages.jsonl
+  data_path: /path/to/dataset.parquet
   data_config: {}
   data_transform:
     _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform
     thinking_mode: auto
+    tools_key: tools
     chat_template_kwargs:
       preserve_thinking: true
-    max_seq_len: 8192
+    max_seq_len: 32768
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader

@@ -32,6 +32,7 @@ from hyper_parallel.distributed.encoder_parallel.attention import current_encode
 from hyper_parallel.distributed.encoder_parallel.contracts import (
     EncoderParallelAdapterSpec, EncoderSegment, EncoderWorkItem,
 )
+from hyper_parallel.models.qwen3_5_moe.adapter.dummy_vision import vision_already_encoded
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -249,7 +250,8 @@ class QwenVisionBridge:
             features = torch.cat([feature for _, feature in records]) if records else None
             token = self.feature_context.set(features)
             try:
-                output = original_forward(*args, **kwargs)
+                with vision_already_encoded():
+                    output = original_forward(*args, **kwargs)
             finally:
                 self.feature_context.reset(token)
             if anchor is not None:

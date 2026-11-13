@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -28,6 +27,7 @@ from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.online.format import (
     InstructionMessages,
     normalize_conversation,
+    normalize_tools,
 )
 from hyper_parallel.data.thinking import validate_thinking_mode
 
@@ -45,30 +45,6 @@ def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> A
         if key in sample:
             return sample[key]
     raise ValueError(f"Sample does not contain any configured text fields: {list(keys)!r}")
-
-
-def _normalize_tools(tools: Any, tools_key: str) -> list[dict[str, Any]] | None:
-    """Normalize an explicitly configured tools field for native chat templates."""
-    if tools is None or tools is False:
-        return None
-    if isinstance(tools, str):
-        if not tools:
-            return None
-        try:
-            tools = json.loads(tools)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Tools field {tools_key!r} must contain valid JSON") from exc
-        if tools is None or tools is False:
-            return None
-    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
-        raise ValueError(f"Tools field {tools_key!r} must be a sequence of mappings")
-
-    normalized_tools = []
-    for tool in tools:
-        if not isinstance(tool, Mapping):
-            raise ValueError(f"Every entry in tools field {tools_key!r} must be a mapping")
-        normalized_tools.append(dict(tool))
-    return normalized_tools or None
 
 
 def _encode_messages(
@@ -192,7 +168,7 @@ class TextConversationTransform:
                     else normalize_conversation(_get_record_value(sample, self.text_keys)))
         tools = None
         if self.tools_key is not None:
-            tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)
+            tools = normalize_tools(sample.get(self.tools_key), self.tools_key)
         encoded = _encode_messages(
             self.chat_template, messages, self.max_seq_len, tools,
             self.thinking_mode, sample.get("enable_thinking"),

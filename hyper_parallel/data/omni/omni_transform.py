@@ -35,6 +35,7 @@ from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.online.format import (
     convert_sharegpt_to_messages,
     normalize_chat_media_fields,
+    normalize_tools,
     resolve_media_path,
 )
 from hyper_parallel.data.thinking import thinking_kwargs, validate_thinking_mode
@@ -302,14 +303,22 @@ class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-met
 
     def __init__(
             self, *, max_seq_len: int, processor: Any, training_mode: str = "sft",
-            sample_format: str = "messages",
+            sample_format: str = "messages", tools_key: str | None = None,
             thinking_mode: str = "legacy", chat_template_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
-        """Select messages/OpenAI/HF or fixed ShareGPT input explicitly."""
+        """Select the message format and optional per-sample tools field.
+
+        ``tools_key`` accepts list or JSON definitions like the text transform.
+        When configured, the sample field overrides static template tools,
+        including missing or empty values (which disable tools for that sample).
+        """
         super().__init__(max_seq_len=max_seq_len, processor=processor, training_mode=training_mode)
         if sample_format not in ("messages", "openai", "hf", "sharegpt"):
             raise ValueError(f"Unsupported AutoProcessor sample format: {sample_format!r}")
 
+        if tools_key is not None and (not isinstance(tools_key, str) or not tools_key):
+            raise ValueError("tools_key must be a non-empty string or None")
+        self.tools_key = tools_key
         self.sample_format = sample_format
         validate_thinking_mode(thinking_mode)
         self.thinking_mode = thinking_mode
@@ -428,7 +437,11 @@ class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-met
         return labels
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Build model inputs and assistant-only labels from processor messages."""
+        """Build model inputs and assistant-only labels from processor messages.
+
+        Args:
+            sample: Conversation record with optional media, tools, and thinking flags.
+        """
         if self.training_mode != "sft":
             raise NotImplementedError("Image-caption pretraining requires a model-specific encoding method")
 
@@ -442,6 +455,8 @@ class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-met
 
         multi_turn = sum(message.get("role") == "assistant" for message in messages) > 1
         defaults = dict(self.chat_template_kwargs)
+        if self.tools_key is not None:
+            defaults["tools"] = normalize_tools(sample.get(self.tools_key), self.tools_key)
         if multi_turn:
             defaults.setdefault("preserve_thinking", True)
         options = [thinking_kwargs(message, self.thinking_mode, sample.get("enable_thinking"), defaults)
