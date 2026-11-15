@@ -256,6 +256,13 @@ class EnvironMeterCallback(Callback):
 
     def _global_samples(self) -> int:
         """Reduce samples across DP+CP while removing CP replicas."""
+        trainer_config = getattr(self.trainer, "config", None)
+        loader_config = getattr(trainer_config, "dataloader", None)
+        if getattr(loader_config, "step_packing", False):
+            # Complete step groups contain GBS original records, regardless of packed row count.
+            global_samples = trainer_config.training.global_batch_size
+            return global_samples
+
         cp_size = self._cp_size()
         reduced_samples = self._reduce(self._local_step_samples, op="sum")
         global_samples = reduced_samples / cp_size

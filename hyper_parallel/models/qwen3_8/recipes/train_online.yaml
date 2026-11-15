@@ -2,7 +2,7 @@
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /home/chaoran/models/Qwen3.8-27B
+  pretrained_model_name_or_path: /home/ma-user/work/w00824760/model_weights/Qwen3.8-27B
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation: sdpa
@@ -90,7 +90,7 @@ dataset:
       reasoning_effort: medium
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: /home/chaoran/models/Qwen3.8-27B
+      pretrained_model_name_or_path: /home/ma-user/work/w00824760/model_weights/Qwen3.8-27B
       local_files_only: true
       use_fast: true
       trust_remote_code: false
@@ -100,7 +100,7 @@ dataset:
     text_keys: messages
     max_seq_len: 4096
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  data_path: /home/chaoran/datasets/decif-30k.jsonl
+  data_path: /home/ma-user/work/w00824760/datasets/decif-30k.jsonl
   data_config:
     dataset_type: mapping
     hf_dataset_name: null
@@ -109,6 +109,7 @@ dataset:
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  step_packing: false # true
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:

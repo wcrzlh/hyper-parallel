@@ -67,6 +67,9 @@ class DataLoaderConfig:
 
     ``load_balance=None`` retains the native loader. A mapping, including an
     empty one, enables distributed balancing with those configuration options.
+    Dynamic loader targets accept ``step_packing=True`` to group the original
+    DP source micro-batches into a single packed computation per optimizer step.
+    Set the packing collator's ``pad_to_length`` to None in that mode.
     """
 
     target: Target[Any]

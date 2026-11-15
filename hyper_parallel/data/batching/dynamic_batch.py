@@ -16,8 +16,9 @@
 
 import operator
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any
 
 from hyper_parallel.data.batching.packing import (
@@ -73,6 +74,63 @@ class BaseCandidateBuffer(ABC):
         """Return whether no candidates remain."""
         is_empty = not self.buffer
         return is_empty
+
+
+@dataclass(frozen=True)
+class StepBatchGrouper:
+    """Collect one complete local optimizer step before packing.
+
+    Group source outputs rather than encoded fragments, so dataset expansion
+    cannot change sample ownership or the original step boundaries. No samples
+    beyond the current group are pulled; checkpoints at yielded boundaries only
+    need the source DataLoader cursor.
+
+    Args:
+        source_batches_per_step: Original source micro-batches belonging to one step.
+        source_batch_size: Original number of records in each source micro-batch.
+    """
+
+    source_batches_per_step: int
+    source_batch_size: int
+
+    def __post_init__(self) -> None:
+        """Require positive source grouping dimensions."""
+        for name in ("source_batches_per_step", "source_batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    def groups(self, source: Iterator[list[Any]]) -> Iterator[list[Any]]:
+        """Yield complete steps in source order, dropping the incomplete tail."""
+        while True:
+            batches = list(islice(source, self.source_batches_per_step))
+            complete_step = (
+                len(batches) == self.source_batches_per_step
+                and all(len(batch) == self.source_batch_size for batch in batches)
+            )
+            if not complete_step:
+                return
+
+            step_samples = [sample for batch in batches for sample in batch]
+            yield step_samples
+
+
+@dataclass
+class StepCandidateBuffer(BaseCandidateBuffer):
+    """Retain one already grouped step without token-budget selection."""
+
+    def build_buffer_entry(self, model_sample: Mapping[str, Any]) -> tuple[Mapping[str, Any], int]:
+        """Keep every encoded fragment independently of its scheduling cost."""
+        buffer_entry = (model_sample, 1)
+        return buffer_entry
+
+    def get_micro_batch(self) -> list[Mapping[str, Any]]:
+        """Remove all samples of the step in their original source order."""
+        samples = [sample for sample, _ in self.buffer]
+        self.buffer = []
+        self.buffer_output_indices = []
+        self.buffer_token_count = 0
+        return samples
 
 
 @dataclass
@@ -499,5 +557,6 @@ __all__ = [
     "IndexReplayCheckpoint",
     "MappingReplayDataset",
     "PackingCandidateBuffer",
+    "StepBatchGrouper",
     "TokenBudgetCandidateBuffer",
 ]

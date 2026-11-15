@@ -30,6 +30,14 @@ def uses_token_batch_loader(config: Any) -> bool:
     return isinstance(target, type) and issubclass(target, TokenBatchLoader)
 
 
+def uses_source_epoch(config: Any) -> bool:
+    """Identify loaders that agree on source exhaustion before each step."""
+    loader_config = getattr(config, "dataloader", None)
+    step_packing = bool(getattr(loader_config, "step_packing", False))
+    requires_source_epoch_sync = uses_token_batch_loader(config) or step_packing
+    return requires_source_epoch_sync
+
+
 def prepare_token_batch_step(
     data_iterator: Any, *, num_micro_batches: int, device: Any, drop_last: bool,
 ) -> Iterator[Any]:
