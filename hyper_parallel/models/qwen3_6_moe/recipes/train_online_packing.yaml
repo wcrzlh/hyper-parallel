@@ -1,4 +1,5 @@
-# Eight-rank text packing smoke: GDN P2P + full-attention KV all-gather.
+# Eight-rank text step packing: GDN P2P + full-attention KV all-gather.
+# GBS counts source samples; split each DP rank's step into packs bounded by max_seq_len.
 # Full attention consumes cu_seq_lens through NPU varlen attention; no quadratic document mask.
 # For a dense reference, use sdpa_hf_cp_wrapper and attention_mode: dense below.
 # Decoder patterns assume the released 40-layer schedule: every fourth layer is full attention.
@@ -143,6 +144,7 @@ dataset:
     data_type: sharegpt
     thinking_mode: auto
     text_keys: messages
+    # Also bounds each packed micro-batch before CP slicing.
     max_seq_len: 32768
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: /home/chaoran/datasets/decif-30k.jsonl
@@ -153,12 +155,11 @@ dataset:
     labels_are_shifted: true
 
 dataloader:
-  _target_: hyper_parallel.data.batching.TokenBatchLoader
-  token_budget: 32768
-  min_buffered_samples: 16
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  step_packing: true
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
-    pad_to_length: 32768
+    pad_to_length: null
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: packed_text

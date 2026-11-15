@@ -29,7 +29,6 @@ from hyper_parallel.trainer.config.data import DataLoaderConfig
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.runtime.dynamic_epoch import prepare_token_batch_step
 from hyper_parallel.trainer.text_trainer import TextTrainer
-from examples.qwen3_6_moe.count_packed_train_iters import LengthDataset, count_epoch
 
 
 text_module = importlib.import_module("hyper_parallel.trainer.text_trainer")
@@ -127,9 +126,18 @@ class TestTokenBatchEpochs(unittest.TestCase):
     """Use real stateful loader checkpoints with a deterministic CPU optimizer."""
 
     def test_multiple_epochs_and_resume_match_uninterrupted(self):
+        """
+        Feature: Source-preserving step packing.
+        Description: Resume token packing across source epoch boundaries.
+        Expectation: The restored run matches uninterrupted sample order and parameter updates.
+        """
         config = _config()
         lengths = [[value] for value in [3, 7, 4, 8, 2, 9, 3, 6, 5, 8, 2, 7, 3, 9, 4, 8, 1, 6, 5, 7]]
-        counts = [count_epoch(config, LengthDataset(lengths), 1, epoch)["optimizer_steps"] for epoch in range(3)]
+        loader = _trainer(config, lengths, 1).base.train_dataloader
+        counts = []
+        for epoch in range(3):
+            loader.set_epoch(epoch)
+            counts.append(sum(1 for _ in loader) // 2)
         limit = sum(counts[:2]) + 1
         uninterrupted = _trainer(config, lengths, limit)
         _run(uninterrupted)
@@ -149,26 +157,23 @@ class TestTokenBatchEpochs(unittest.TestCase):
                 self.assertEqual(prefix.losses + suffix.losses, uninterrupted.losses)
                 torch.testing.assert_close(suffix.weight, uninterrupted.weight, rtol=0, atol=0)
 
-    def test_counter_reports_uneven_dp_tail(self):
-        config = _config()
-        config.training.global_batch_size = 4
-        config.dataloader.sampler_type = "single"
-        # DP0 gets long samples, DP1 short ones: packing produces different counts.
-        lengths = [[length] for _ in range(12) for length in (9, 2)]
-        result = count_epoch(config, LengthDataset(lengths), 2, 0)
-        self.assertEqual(result["packed_batches_per_dp"], [12, 2])
-        self.assertEqual(result["optimizer_steps"], 1)
-        self.assertEqual(result["omitted_packed_batches_per_dp"], [10, 0])
-
     def test_incomplete_epoch_fails_instead_of_looping(self):
         trainer = _trainer(_config(), [[3]], 3)
         with self.assertRaisesRegex(ValueError, "complete distributed optimizer step"):
             _run(trainer)
 
     def test_partial_step_is_rejected_before_forward(self):
+        """
+        Feature: Source-preserving step packing.
+        Description: The source cannot supply a complete optimizer step.
+        Expectation: Preparation stops or raises according to drop_last before forward.
+        """
         with self.assertRaises(StopIteration):
             prepare_token_batch_step(iter([1]), num_micro_batches=2, device="cpu", drop_last=True)
         with self.assertRaisesRegex(ValueError, "incomplete distributed"):
             prepare_token_batch_step(iter([1]), num_micro_batches=2, device="cpu", drop_last=False)
-        self.assertEqual(list(prepare_token_batch_step(iter([1, 2]), num_micro_batches=2,
-                                                       device="cpu", drop_last=True)), [1, 2])
+        iterator, count = prepare_token_batch_step(
+            iter([1, 2]), num_micro_batches=2, device="cpu", drop_last=True,
+        )
+        self.assertEqual(list(iterator), [1, 2])
+        self.assertEqual(count, 2)

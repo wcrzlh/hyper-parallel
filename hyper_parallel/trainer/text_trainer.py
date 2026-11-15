@@ -332,9 +332,10 @@ class TextTrainer:
             try:
                 step_iterator = data_iterator
                 if token_loader:
-                    step_iterator = prepare_token_batch_step(
+                    step_iterator, self.base.num_micro_batches = prepare_token_batch_step(
                         data_iterator, num_micro_batches=self.base.num_micro_batches,
                         device=self.base.device, drop_last=self.base.config.dataloader.drop_last,
+                        step_packing=getattr(self.base.config.dataloader, "step_packing", False),
                     )
                 self.train_step(step_iterator)
             except StopIteration:

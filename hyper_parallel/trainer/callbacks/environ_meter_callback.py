@@ -438,6 +438,10 @@ class EnvironMeterCallback(Callback):
             **self._memory_metrics(),
         }
 
+        loader_config = getattr(getattr(self.trainer, "config", None), "dataloader", None)
+        if getattr(loader_config, "step_packing", False):
+            env_metrics["data/num_micro_batches"] = float(self.trainer.num_micro_batches)
+
         training_config = getattr(getattr(self.trainer, "config", None), "training", None)
         model_config = getattr(self.trainer, "model_config", None)
         if (

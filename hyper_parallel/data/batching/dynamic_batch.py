@@ -14,6 +14,8 @@
 # ============================================================================
 """Candidate buffering and finalization used by dynamic DataLoaders."""
 
+from __future__ import annotations
+
 import operator
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -443,6 +445,22 @@ class _BatchPipeline(ABC):
         """Finish selected samples before final collation."""
         raise NotImplementedError
 
+    def prepare_step_samples(self, samples: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
+        """Expose final individual token lengths for step-local partitioning.
+
+        Args:
+            samples: Source samples to measure before partitioning.
+        """
+        return samples
+
+    def pack_step_samples(self, samples: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
+        """Prepare an already encoded partition for the final collator.
+
+        Args:
+            samples: Encoded source samples belonging to one partition.
+        """
+        return samples
+
     def encode_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
         """Apply an optional final batch encoding stage."""
         return batch
@@ -544,6 +562,22 @@ class _OmniPackingPipeline(_BatchPipeline):
 
         packed_samples = [packed_sample]
         return packed_samples
+
+    def prepare_step_samples(self, samples: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
+        """Encode each source sample once before measuring its token length.
+
+        Args:
+            samples: Source samples requiring modality-specific encoding.
+        """
+        return [self.selected_sample_encoder(sample) for sample in samples]
+
+    def pack_step_samples(self, samples: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
+        """Pack encoded samples while retaining modality-specific metadata.
+
+        Args:
+            samples: Encoded source samples belonging to one partition.
+        """
+        return [self.packer.pack_selected_samples(samples)]
 
     def encode_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
         """Apply the composed final batch encoder."""
