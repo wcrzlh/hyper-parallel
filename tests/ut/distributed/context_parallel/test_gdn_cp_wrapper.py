@@ -14,8 +14,11 @@
 # ============================================================================
 """Unit tests for the Gated DeltaNet CP inner wrapper."""
 
+import pytest
 import torch
+from torch.nn import functional as F
 
+from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
 from hyper_parallel.distributed.context_parallel import wrappers as cp_wrappers
 from hyper_parallel.distributed.context_parallel import gated_delta_net as cp_gdn
 
@@ -238,3 +241,98 @@ def test_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):
     torch.testing.assert_close(module.forward(inputs), inputs + 3)
     assert module.causal_conv1d_fn is original_conv
     assert module.chunk_gated_delta_rule is original_rule
+
+
+@pytest.mark.parametrize("fused,dilation", [(False, 1), (False, 2), (True, 1)])
+def test_packed_conv_preserves_documents_and_halo_gradients(monkeypatch, fused, dilation):
+    """Feature: Packed GDN convolution halo.
+
+    Description: Sweep document starts around a CP cut.
+    Expectation: Outputs and all halo and parameter gradients match independent documents.
+    """
+    torch.manual_seed(42)
+    halo_width = 3 * dilation
+    conv = torch.nn.Conv1d(2, 2, 4, padding=halo_width, dilation=dilation, groups=2).double()
+    weight, bias = conv.weight, conv.bias
+
+    def _original(value, conv_weight, conv_bias, activation):
+        output = torch.conv1d(value, conv_weight.unsqueeze(1), conv_bias,
+                          padding=halo_width, dilation=dilation, groups=2)[..., :value.shape[-1]]
+        return F.silu(output) if activation == "silu" else output
+
+    layouts = [(0, 16), *((0, boundary, 16) for boundary in range(1, 16)),
+               (0, 1, 7, 8, 9, 15, 16), (0, 5, 7, 9, 10, 16)]
+    for offsets in layouts:
+        inputs = torch.randn(1, 2, 16, dtype=torch.float64, requires_grad=True)
+        expected = torch.cat([
+            _original(inputs[..., left:right], weight.squeeze(1), bias, "silu" if fused else None)
+            for left, right in zip(offsets, offsets[1:])], dim=-1)
+        for rank in range(2):
+            start, end = rank * 8, (rank + 1) * 8
+            local = inputs[..., start:end].detach().clone().requires_grad_()
+            halo = inputs[..., start - halo_width:start] if rank else inputs.new_zeros(1, 2, halo_width)
+            halo = halo.detach().clone().requires_grad_()
+            monkeypatch.setattr(cp_gdn, "_exchange_previous_cp_halo", lambda tail, mesh: halo)
+            info = PackedSequenceInfo(offsets, start, end)
+            if fused:
+                actual = cp_gdn._gdn_cp_causal_conv1d(
+                    _original, _FakeCPMesh(), local, weight.squeeze(1), bias, "silu", sequence_info=info)
+            else:
+                actual = cp_gdn._gdn_cp_conv1d_module(conv.forward, conv, _FakeCPMesh(), local, sequence_info=info)
+            message = f"offsets={offsets}, rank={rank}, fused={fused}, dilation={dilation}"
+            torch.testing.assert_close(actual, expected[..., start:end], atol=1e-12, rtol=1e-12, msg=message)
+            grad = torch.randn_like(actual)
+            expected_grads = torch.autograd.grad(
+                expected[..., start:end], (inputs, weight, bias), grad, retain_graph=True)
+            # allow_unused=False also checks that a fully masked halo retains an
+            # autograd edge: its reverse collective must run even at a document start.
+            actual_grads = torch.autograd.grad(actual, (local, halo, weight, bias), grad, allow_unused=False)
+            expected_halo = expected_grads[0][..., start - halo_width:start] if rank else torch.zeros_like(halo)
+            references = (expected_grads[0][..., start:end], expected_halo, *expected_grads[1:])
+            for actual_grad, expected_grad in zip(actual_grads, references):
+                torch.testing.assert_close(actual_grad, expected_grad, atol=1e-12, rtol=1e-12, msg=message)
+            document_start = max(boundary for boundary in offsets if boundary <= start)
+            unused = halo_width - min(halo_width, start - document_start)
+            torch.testing.assert_close(
+                actual_grads[1][..., :unused], torch.zeros_like(halo[..., :unused]), atol=0, rtol=0, msg=message)
+
+
+def test_packed_rule_overrides_stale_local_kernel_offsets():
+    """Feature: Packed GDN rule metadata.
+
+    Description: Supply stale local offsets before Ulysses exchange.
+    Expectation: The kernel receives global document offsets.
+    """
+    info = PackedSequenceInfo((0, 3, 13, 16), 0, 16)
+    query = torch.randn(1, 16, 1, 2)
+    decay = torch.zeros(1, 16, 1)
+
+    def _rule(query, key, value, *, g, beta, cu_seqlens):
+        del key, value, g, beta
+        torch.testing.assert_close(cu_seqlens, torch.tensor([0, 3, 13, 16]))
+        return query, None
+
+    output, _ = cp_gdn._gdn_packed_rule(
+        _rule, query, query, query, info, g=decay, beta=decay, cu_seqlens=torch.tensor([0, 5, 8]))
+    torch.testing.assert_close(output, query)
+
+
+def test_packed_rule_does_not_trust_kwargs_only_fallback():
+    """Feature: Packed GDN reference fallback.
+
+    Description: Invoke a reference primitive that ignores cumulative lengths.
+    Expectation: Recurrence resets at every document with zero gradient leakage.
+    """
+    query = torch.ones(1, 8, 1, 2, requires_grad=True)
+    decay = torch.zeros(1, 8, 1)
+
+    def _rule(query, key, value, **kwargs):
+        del key, value, kwargs
+        return query.cumsum(dim=1), None
+
+    output, _ = cp_gdn._gdn_packed_rule(
+        _rule, query, query, query, PackedSequenceInfo((0, 3, 8), 0, 8), g=decay, beta=decay)
+    expected = torch.tensor([1, 2, 3, 1, 2, 3, 4, 5]).reshape(1, 8, 1, 1).expand_as(query).float()
+    torch.testing.assert_close(output, expected)
+    output[:, 3:].sum().backward()
+    torch.testing.assert_close(query.grad[:, :3], torch.zeros_like(query.grad[:, :3]))

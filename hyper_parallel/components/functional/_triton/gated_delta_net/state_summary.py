@@ -37,7 +37,7 @@ from .utils import get_autotune_config
     ),
     key=["H", "K", "V", "BT", "BV"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NT"])
 def gdn_packed_state_summary_kernel(
     k,
     w,
@@ -50,7 +50,7 @@ def gdn_packed_state_summary_kernel(
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
-    NT: tl.constexpr,
+    NT,
 ):
     """Build the local affine state transition and extension in one buffer."""
     i_v = tl.program_id(0)
@@ -149,7 +149,7 @@ def gdn_packed_state_summary_kernel(
     ),
     key=["H", "K", "V", "BT"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NT"])
 def gdn_state_grad_ext_kernel(
     q,
     k,
@@ -165,7 +165,7 @@ def gdn_state_grad_ext_kernel(
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
-    NT: tl.constexpr,
+    NT,
 ):
     """Build the local-loss contribution to the incoming state gradient."""
     i_v = tl.program_id(0)

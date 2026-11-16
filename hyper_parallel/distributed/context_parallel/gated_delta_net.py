@@ -1489,10 +1489,31 @@ def _exchange_previous_cp_halo(tail: torch.Tensor, cp_mesh: Any) -> torch.Tensor
     return halo.transpose(1, 2).contiguous()
 
 
+def _gdn_packed_conv1d(
+        original_conv: Callable[[torch.Tensor], torch.Tensor],
+        hidden_states: torch.Tensor, halo: torch.Tensor,
+        sequence_info: PackedSequenceInfo) -> torch.Tensor:
+    """Convolve document fragments, retaining only same-document CP history."""
+    outputs = []
+    prefix = min(halo.shape[-1], sequence_info.preceding_sample_tokens)
+    for index, (start, end) in enumerate(zip(
+            sequence_info.local_offsets[:-1], sequence_info.local_offsets[1:])):
+        fragment = hidden_states[..., start:end]
+        history = prefix if index == 0 else 0
+        if index == 0:
+            # Even an empty halo slice must stay in the autograd graph so every
+            # rank participates in the reverse halo collective at document resets.
+            fragment = torch.cat((halo[..., halo.shape[-1] - history:], fragment), dim=-1)
+        output = original_conv(fragment)
+        outputs.append(output[..., history:history + end - start])
+    return torch.cat(outputs, dim=-1).contiguous()
+
+
 def _gdn_cp_causal_conv1d(
         original_conv: Callable[..., Any], cp_mesh: Any,
         hidden_states: torch.Tensor, weight: torch.Tensor,
-        bias: Any = None, activation: Any = None, **kwargs: Any) -> Any:
+        bias: Any = None, activation: Any = None,
+        sequence_info: Optional[PackedSequenceInfo] = None, **kwargs: Any) -> Any:
     """Run the original causal Conv1d with the previous CP rank's halo."""
     halo_width = weight.shape[-1] - 1
     if halo_width <= 0 or cp_mesh.size() <= 1:
@@ -1506,6 +1527,10 @@ def _gdn_cp_causal_conv1d(
         )
     tail = hidden_states[..., -halo_width:].contiguous()
     halo = _exchange_previous_cp_halo(tail, cp_mesh)
+    if sequence_info is not None:
+        return _gdn_packed_conv1d(
+            lambda inputs: original_conv(inputs, weight, bias, activation, **kwargs),
+            hidden_states, halo, sequence_info)
     conv_input = torch.cat((halo, hidden_states), dim=-1)
     output = original_conv(
         conv_input, weight, bias, activation, **kwargs)
@@ -1514,7 +1539,8 @@ def _gdn_cp_causal_conv1d(
 
 def _gdn_cp_conv1d_module(
         original_forward: Callable[..., Any], conv_module: Any,
-        cp_mesh: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        cp_mesh: Any, hidden_states: torch.Tensor,
+        sequence_info: Optional[PackedSequenceInfo] = None) -> torch.Tensor:
     """Run the Transformers Conv1d fallback with the previous CP halo."""
     kernel_size = conv_module.kernel_size[0]
     dilation = conv_module.dilation[0]
@@ -1529,6 +1555,8 @@ def _gdn_cp_conv1d_module(
         )
     tail = hidden_states[..., -halo_width:].contiguous()
     halo = _exchange_previous_cp_halo(tail, cp_mesh)
+    if sequence_info is not None:
+        return _gdn_packed_conv1d(original_forward, hidden_states, halo, sequence_info)
     conv_input = torch.cat((halo, hidden_states), dim=-1)
     output = original_forward(conv_input)
     local_length = hidden_states.shape[-1]
@@ -1569,6 +1597,29 @@ def _gdn_rule_hp_to_cp(
         )
     return ulysses_head_to_seq(
         output, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
+
+
+def _gdn_packed_rule(
+        original_rule: Callable[..., Any], query: torch.Tensor,
+        key: torch.Tensor, value: torch.Tensor,
+        sequence_info: PackedSequenceInfo, **kwargs: Any) -> Any:
+    """Reset recurrent state at real document boundaries after Ulysses exchange."""
+    if "cu_seqlens" in inspect.signature(original_rule).parameters:
+        kwargs["cu_seqlens"] = sequence_info.materialize(
+            query.device, kwargs.get("chunk_size", 64)).cu_seqlens
+        return original_rule(query, key, value, **kwargs)
+    # HF's Torch reference accepts **kwargs but ignores cu_seqlens. Preserve
+    # that primitive, invoking it independently for each document instead.
+    kwargs.pop("cu_seqlens", None)
+    outputs = []
+    for start, end in zip(sequence_info.local_offsets[:-1], sequence_info.local_offsets[1:]):
+        call_kwargs = dict(kwargs, g=kwargs["g"][:, start:end], beta=kwargs["beta"][:, start:end])
+        output, state = original_rule(
+            query[:, start:end], key[:, start:end], value[:, start:end], **call_kwargs)
+        if state is not None:
+            raise NotImplementedError("GDN CP does not support a returned recurrent state")
+        outputs.append(output)
+    return torch.cat(outputs, dim=1), None
 
 
 def _validate_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
@@ -1623,8 +1674,20 @@ def install_gdn_ulysses_cp(
     target_module: Any,
     cp_mesh: Any,
 ) -> None:
-    """Install primitive-level Ulysses CP around a GDN forward."""
+    """Install primitive-level Ulysses CP around a GDN forward.
+
+    Packed inputs use global sample offsets or ``PackedSequenceInfo``. The
+    original convolution runs independently on document fragments, with CP halo
+    restricted to the continued document. The rule consumes full-document
+    boundaries after sequence-to-head exchange; CP cuts never reset its state.
+
+    Args:
+        target_module: GDN module retaining its native forward implementation.
+        cp_mesh: Active context-parallel mesh.
+    """
     _validate_gdn_cp(target_module, cp_mesh)
+    if getattr(target_module, "_hp_gdn_cp_config", None) is not None:
+        raise ValueError("GDN CP is already installed on the target module")
     original_forward = target_module.forward
     forward_impl = _resolve_gdn_forward_implementation(original_forward)
     forward_globals = forward_impl.__globals__
@@ -1681,7 +1744,9 @@ def install_gdn_ulysses_cp(
         else:
             owner[name] = value
 
-    def make_cp_rule(original_rule: Callable[..., Any]) -> Callable[..., Any]:
+    def make_cp_rule(
+            original_rule: Callable[..., Any],
+            sequence_info: Optional[PackedSequenceInfo]) -> Callable[..., Any]:
         """Build one CP-aware wrapper for a referenced GDN rule primitive."""
         @functools.wraps(original_rule)
         def cp_rule(
@@ -1710,7 +1775,12 @@ def install_gdn_ulysses_cp(
                 query, key, value, decay, beta, cp_mesh)
             call_kwargs = dict(kwargs)
             call_kwargs.update(g=decay, beta=beta)
-            output = original_rule(query, key, value, **call_kwargs)
+            if sequence_info is None:
+                output = original_rule(query, key, value, **call_kwargs)
+            else:
+                exchanged_info = sequence_info.ulysses(cp_mesh.size(), cp_mesh.get_local_rank())
+                output = _gdn_packed_rule(
+                    original_rule, query, key, value, exchanged_info, **call_kwargs)
             if not isinstance(output, tuple) or len(output) != 2:
                 raise TypeError(
                     "GDN rule must return (output, recurrent_state)"
@@ -1734,10 +1804,16 @@ def install_gdn_ulysses_cp(
             raise NotImplementedError(
                 "GDN CP currently supports training with cache_params=None"
             )
-        if kwargs.get("cu_seq_lens_q") is not None:
-            raise NotImplementedError(
-                "GDN CP does not support packed sequences"
-            )
+        hidden_states = args[0] if args else kwargs["hidden_states"]
+        has_packing = any(kwargs.get(name) is not None for name in (
+            "packed_sequence_info", "cu_seq_lens", "cu_seqlens", "cu_seq_lens_q", "cu_seq_lens_k",
+            "packed_seq_params", "seq_idx"))
+        sequence_info = None
+        if has_packing:
+            if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+                raise ValueError("Packed GDN CP requires hidden_states with shape [1, local_length, hidden_size]")
+            sequence_info = resolve_packed_sequence(
+                kwargs, hidden_states.shape[1], cp_rank=cp_mesh.get_local_rank(), cp_size=cp_mesh.size())
 
         fired = {"conv": 0, "rule": 0}
 
@@ -1748,6 +1824,8 @@ def install_gdn_ulysses_cp(
                 if not conv_args and "x" in conv_kwargs:
                     conv_kwargs = dict(conv_kwargs)
                     conv_args = (conv_kwargs.pop("x"),)
+                if sequence_info is not None:
+                    conv_kwargs["sequence_info"] = sequence_info
                 return _gdn_cp_causal_conv1d(
                     original_conv, cp_mesh, *conv_args, **conv_kwargs)
         else:
@@ -1755,7 +1833,7 @@ def install_gdn_ulysses_cp(
             def cp_conv(hidden_states: torch.Tensor) -> torch.Tensor:
                 fired["conv"] += 1
                 return _gdn_cp_conv1d_module(
-                    original_conv_forward, conv_module, cp_mesh, hidden_states)
+                    original_conv_forward, conv_module, cp_mesh, hidden_states, sequence_info)
 
         def count_rule(wrapped_rule):
             @functools.wraps(wrapped_rule)
@@ -1766,7 +1844,7 @@ def install_gdn_ulysses_cp(
             return counted_rule
 
         wrapped_rules = {
-            name: count_rule(make_cp_rule(original_rule))
+            name: count_rule(make_cp_rule(original_rule, sequence_info))
             for name, original_rule in original_rules.items()
         }
 
@@ -1794,3 +1872,4 @@ def install_gdn_ulysses_cp(
         return output
 
     target_module.forward = cp_forward
+    target_module._hp_gdn_cp_config = {"mode": "ulysses", "primitive_interception": True}

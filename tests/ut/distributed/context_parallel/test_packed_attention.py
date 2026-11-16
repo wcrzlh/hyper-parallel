@@ -14,6 +14,7 @@
 # ============================================================================
 """Dense-reference parity for packed KV-prefix attention under arbitrary CP cuts."""
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -83,47 +84,128 @@ class TestPackedAttention(unittest.TestCase):
                     for original, copied in zip(inputs, copies):
                         torch.testing.assert_close(copied.grad, original.grad, atol=1e-12, rtol=1e-12)
 
+    def test_ulysses_global_boundaries_and_gradients(self):
+        """Feature: Packed Ulysses attention.
+
+        Description: Emulate differentiable head exchange across CP cuts.
+        Expectation: Outputs and gradients match independent document attention.
+        """
+        torch.manual_seed(19)
+        for offsets in ((0, 32), (0, 16, 32), (0, 1, 15, 17, 31, 32)):
+            with self.subTest(offsets=offsets):
+                inputs = [torch.randn(1, heads, 32, 8, dtype=torch.float64, requires_grad=True)
+                          for heads in (6, 2, 2)]
+                copies = [tensor.detach().clone().requires_grad_() for tensor in inputs]
+                expected, _ = _reference_varlen(
+                    None, *inputs, None, cu_seq_lens_q=offsets, cu_seq_lens_k=offsets,
+                )
+                head_outputs = []
+                for rank in range(2):
+                    mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: rank)
+                    module = SimpleNamespace(packed_attention_cp_mesh=mesh, is_causal=True)
+                    shards = [tensor.chunk(2, dim=1)[rank] for tensor in copies]
+
+                    def _restore(output, seq_dim, head_dim, cp_mesh):
+                        self.assertEqual((seq_dim, head_dim), (1, 2))
+                        self.assertIs(cp_mesh, mesh)
+                        return output
+
+                    with patch.object(packed, "ulysses_seq_to_head", side_effect=shards) as exchange, \
+                            patch.object(packed, "ulysses_head_to_seq", side_effect=_restore), \
+                            patch.object(packed, "npu_fusion_attention_forward", side_effect=_reference_varlen) as kernel:
+                        result, _ = packed.packed_ulysses_attention_forward(
+                            module, *(tensor[:, :, rank * 16:(rank + 1) * 16] for tensor in copies), None,
+                            cu_seq_lens_q=offsets, cu_seq_lens_k=offsets,
+                        )
+                    self.assertEqual(exchange.call_count, 3)
+                    for call in exchange.call_args_list:
+                        self.assertEqual(call.args[1:3], (2, 1))
+                    self.assertEqual(kernel.call_args.kwargs["cu_seq_lens_q"], offsets)
+                    head_outputs.append(result)
+                actual = torch.cat(head_outputs, dim=2)
+                torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+                # Supervise one document: every other document must have zero Q/K/V gradient.
+                upstream = torch.zeros_like(expected)
+                left, right = offsets[:2]
+                upstream[:, left:right] = torch.randn_like(upstream[:, left:right])
+                expected.backward(upstream)
+                actual.backward(upstream)
+                for original, copied in zip(inputs, copies):
+                    torch.testing.assert_close(copied.grad, original.grad, atol=1e-12, rtol=1e-12)
+                    torch.testing.assert_close(copied.grad[:, :, right:],
+                                               torch.zeros_like(copied.grad[:, :, right:]), atol=0, rtol=0)
+
     def test_reject_dense_mask_and_inconsistent_metadata(self):
-        tensor = torch.zeros(1, 2, 8, 4)
+        """Feature: Packed attention input validation.
+
+        Description: Supply masks, inconsistent boundaries or non-divisible KV heads.
+        Expectation: Invalid configurations raise before communication.
+        """
         mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1)
         module = SimpleNamespace(packed_attention_cp_mesh=mesh, is_causal=True)
-        with self.assertRaisesRegex(ValueError, "no dense mask"):
-            packed.packed_allgather_attention_forward(module, tensor, tensor, tensor, torch.ones(8, 16))
-        with self.assertRaisesRegex(ValueError, "matching global"):
-            packed.packed_allgather_attention_forward(
-                module, tensor, tensor, tensor, None, cu_seq_lens_q=(0, 16), cu_seq_lens_k=(0, 8, 16),
-            )
-        with self.assertRaisesRegex(ValueError, "current contiguous"):
-            packed.packed_allgather_attention_forward(
-                module, tensor, tensor, tensor, None, cu_seq_lens_q=(0, 16), cu_seq_lens_k=(0, 16),
-                packed_sequence_info=PackedSequenceInfo((0, 16), 0, 8),
+        for forward in (packed.packed_allgather_attention_forward, packed.packed_ulysses_attention_forward):
+            with self.subTest(forward=forward.__name__):
+                with self.assertRaisesRegex(ValueError, "no dense mask"):
+                    forward(module, tensor, tensor, tensor, torch.ones(8, 16))
+                with self.assertRaisesRegex(ValueError, "matching global"):
+                    forward(module, tensor, tensor, tensor, None,
+                            cu_seq_lens_q=(0, 16), cu_seq_lens_k=(0, 8, 16))
+                with self.assertRaisesRegex(ValueError, "current contiguous"):
+                    forward(
+                        module, tensor, tensor, tensor, None, cu_seq_lens_q=(0, 16), cu_seq_lens_k=(0, 16),
+                        packed_sequence_info=PackedSequenceInfo((0, 16), 0, 8),
+                    )
+        with self.assertRaisesRegex(ValueError, "head count to be divisible"):
+            packed.packed_ulysses_attention_forward(
+                module, tensor, tensor[:, :1], tensor[:, :1], None,
+                cu_seq_lens_q=(0, 16), cu_seq_lens_k=(0, 16),
             )
 
     def test_hf_interface_forwards_boundaries_without_building_mask(self):
-        """Exercise actual HF Qwen projections/RoPE and the custom-interface mask bypass."""
-        config = Qwen3_5MoeTextConfig.from_dict({
-            "hidden_size": 24, "num_attention_heads": 6, "num_key_value_heads": 2, "head_dim": 4,
-        })
-        config._attn_implementation = "sdpa"
-        module = Qwen3_5MoeAttention(config, 3)
-        mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1)
-        forward = packed.packed_allgather_hf_cp_wrapper(module, None, None, mesh, None)
-        hidden = torch.randn(1, 8, 24)
-        mask = create_causal_mask(
-            config=config, inputs_embeds=hidden, attention_mask=None, past_key_values=None,
-            position_ids=torch.tensor([[5, 6, 7, 8, 0, 1, 2, 3]]),
-        )
-        self.assertIsNone(mask)
+        """Feature: Packed HF attention interface.
 
-        def _gather(key, value, *_):
-            return torch.cat((key, key), dim=2), torch.cat((value, value), dim=2)
-
-        with patch.object(packed, "flex_cp_allgather", side_effect=_gather):
-            with patch.object(packed, "npu_fusion_attention_forward", side_effect=_reference_varlen) as backend:
-                result, _ = forward(
-                    hidden, position_embeddings=(torch.ones(1, 8, 4), torch.zeros(1, 8, 4)),
-                    attention_mask=mask, cu_seq_lens_q=(0, 3, 12, 16), cu_seq_lens_k=(0, 3, 12, 16),
+        Description: Exercise HF projections and RoPE for both CP algorithms.
+        Expectation: Global boundaries reach Ulysses and HF builds no dense mask.
+        """
+        for use_ulysses in (False, True):
+            with self.subTest(ulysses=use_ulysses):
+                config = Qwen3_5MoeTextConfig.from_dict({
+                    "hidden_size": 24, "num_attention_heads": 6, "num_key_value_heads": 2, "head_dim": 4,
+                })
+                config._attn_implementation = "sdpa"
+                module = Qwen3_5MoeAttention(config, 3)
+                mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1)
+                wrapper = packed.packed_ulysses_hf_cp_wrapper if use_ulysses else packed.packed_allgather_hf_cp_wrapper
+                forward = wrapper(module, None, None, mesh, None)
+                hidden = torch.randn(1, 8, 24)
+                mask = create_causal_mask(
+                    config=config, inputs_embeds=hidden, attention_mask=None, past_key_values=None,
+                    position_ids=torch.tensor([[5, 6, 7, 8, 0, 1, 2, 3]]),
                 )
-        self.assertEqual(result.shape, hidden.shape)
-        self.assertEqual(backend.call_args.kwargs["cu_seq_lens_q"], (0, 4, 8))
-        self.assertEqual(backend.call_args.kwargs["cu_seq_lens_k"], (0, 9, 13))
+                self.assertIsNone(mask)
+
+                def _gather(key, value, *_):
+                    return torch.cat((key, key), dim=2), torch.cat((value, value), dim=2)
+
+                def _seq_to_head(tensor, *_):
+                    return torch.cat((tensor, tensor), dim=2).chunk(2, dim=1)[1]
+
+                def _head_to_seq(tensor, *_):
+                    return torch.cat((tensor, tensor), dim=2)[:, 8:]
+
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(packed, "flex_cp_allgather", side_effect=_gather))
+                    stack.enter_context(patch.object(packed, "ulysses_seq_to_head", side_effect=_seq_to_head))
+                    stack.enter_context(patch.object(packed, "ulysses_head_to_seq", side_effect=_head_to_seq))
+                    backend = stack.enter_context(
+                        patch.object(packed, "npu_fusion_attention_forward", side_effect=_reference_varlen),
+                    )
+                    result, _ = forward(
+                        hidden, position_embeddings=(torch.ones(1, 8, 4), torch.zeros(1, 8, 4)),
+                        attention_mask=mask, cu_seq_lens_q=(0, 3, 12, 16), cu_seq_lens_k=(0, 3, 12, 16),
+                    )
+                self.assertEqual(result.shape, hidden.shape)
+                expected_q = (0, 3, 12, 16) if use_ulysses else (0, 4, 8)
+                expected_k = (0, 3, 12, 16) if use_ulysses else (0, 9, 13)
+                self.assertEqual(backend.call_args.kwargs["cu_seq_lens_q"], expected_q)
+                self.assertEqual(backend.call_args.kwargs["cu_seq_lens_k"], expected_k)
