@@ -548,12 +548,16 @@ class _OmniPackingPipeline(_BatchPipeline):
             self,
             selected_samples: Sequence[Mapping[str, Any]],
     ) -> Sequence[Mapping[str, Any]]:
-        """Encode and pack one selected sample group."""
+        """Encode and pack one selected sample group.
+
+        Args:
+            selected_samples: Candidate samples selected for one packed sequence.
+        """
         encoded_samples = []
         for selected_sample in selected_samples:
             encoded_sample = self.selected_sample_encoder(selected_sample)
             if not isinstance(encoded_sample, Mapping):
-                raise TypeError("postencode_sample must return a mapping")
+                raise TypeError("post_encode_sample must return a mapping")
             encoded_samples.append(encoded_sample)
 
         packed_sample = self.packer.pack_selected_samples(encoded_samples)

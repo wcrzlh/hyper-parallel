@@ -116,8 +116,8 @@ class OmniDataTransform:
     """Define model-specific sample and batch encoding hooks.
 
     Eager transforms implement ``encode_sample`` to return model inputs and labels.
-    Deferred transforms provide ``preencode_sample`` and ``postencode_sample``;
-    offline metadata needs only ``postencode_sample``. The pipeline detects
+    Deferred transforms provide ``pre_encode_sample`` and ``post_encode_sample``;
+    offline metadata needs only ``post_encode_sample``. The pipeline detects
     these hook combinations automatically.
 
     Packing selection and concatenation belong to the optional packing path
@@ -142,7 +142,11 @@ class OmniDataTransform:
         self.processor = processor
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
-        """Return whether one source record contains conversation messages."""
+        """Return whether one source record contains conversation messages.
+
+        Args:
+            sample: Source record containing messages.
+        """
         messages = sample.get("messages")
         if not isinstance(messages, list):
             raise ValueError("Omni sample messages must be a list")
@@ -151,19 +155,31 @@ class OmniDataTransform:
         return valid_sample
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
-        """Encode a complete sample with unshifted labels, or return None to skip it."""
+        """Encode a complete sample with unshifted labels, or return None to skip it.
+
+        Args:
+            sample: Source record to encode.
+        """
         del sample
         raise NotImplementedError(f"{type(self).__name__} does not implement sample encoding")
 
-    def preencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Prepare metadata used by a packing selector without full encoding."""
-        del sample
-        raise NotImplementedError(f"{type(self).__name__} does not implement preencode_sample")
+    def pre_encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Prepare metadata used by a packing selector without full encoding.
 
-    def postencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Encode selected online or offline metadata into a model-ready sample."""
+        Args:
+            sample: Source record to prepare for selection.
+        """
         del sample
-        raise NotImplementedError(f"{type(self).__name__} does not implement postencode_sample")
+        raise NotImplementedError(f"{type(self).__name__} does not implement pre_encode_sample")
+
+    def post_encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Encode selected online or offline metadata into a model-ready sample.
+
+        Args:
+            sample: Selected record and its prepared metadata.
+        """
+        del sample
+        raise NotImplementedError(f"{type(self).__name__} does not implement post_encode_sample")
 
     def encode_batch(self, batch: Any) -> Any:
         """Apply an optional model-specific batch encoding stage.
@@ -332,7 +348,11 @@ class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-met
                 raise ValueError(f"chat_template_kwargs.{key} must be a bool")
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
-        """Filter the configured conversation column before source construction."""
+        """Filter the configured conversation column before source construction.
+
+        Args:
+            sample: Source record containing the configured conversation column.
+        """
         message_key = "conversations" if self.sample_format == "sharegpt" else "messages"
         messages = sample.get(message_key)
         if not isinstance(messages, list):
@@ -482,8 +502,6 @@ class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-met
 
         input_ids = encoded_sample["input_ids"].squeeze(0)
         prompt_ids = prompt_sample["input_ids"].squeeze(0)
-        if len(input_ids) > self.max_seq_len:
-            raise ValueError("Omni sample exceeds max_seq_len; refusing to truncate a possible media span")
         prompt_length = self._assistant_prompt_length(messages, input_ids, prompt_ids, template_kwargs)
 
         media_mask = None
@@ -498,9 +516,14 @@ class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-met
             if messages[-1].get("loss_mask", 1) != 1:
                 labels.fill_(IGNORE_INDEX)
 
-        # Single-sample token fields: [1, L] -> [L]; media tensors keep the processor layout.
+        return self._finalize_encoded_sample(encoded_sample, labels)
+
+    def _finalize_encoded_sample(self, encoded_sample: dict[str, Any], labels: torch.Tensor) -> dict[str, Any]:
+        """Right-truncate aligned token fields after locating full-conversation supervision."""
+        # Media tensors keep the processor layout.
         for field in OMNI_CP_TOKEN_FIELDS.intersection(encoded_sample):
-            encoded_sample[field] = encoded_sample[field].squeeze(0)
+            encoded_sample[field] = encoded_sample[field].squeeze(0)[..., :self.max_seq_len]
+        labels = labels[:self.max_seq_len]
         if not bool(labels[1:].ne(IGNORE_INDEX).any()):
             raise ValueError("Omni sample has no supervised assistant tokens")
         encoded_sample["labels"] = labels
@@ -519,40 +542,44 @@ class _OmniTransformStrategy:
 
     @classmethod
     def from_transform(cls, transform: OmniDataTransform) -> "_OmniTransformStrategy":
-        """Select eager or deferred encoding from the implemented pipeline hooks."""
+        """Select eager or deferred encoding from the implemented pipeline hooks.
+
+        Args:
+            transform: Transform whose encoding hooks determine the strategy.
+        """
         transform_type = type(transform)
         encode_sample = transform_type.encode_sample is not OmniDataTransform.encode_sample
-        preencode_sample = transform_type.preencode_sample is not OmniDataTransform.preencode_sample
-        postencode_sample = transform_type.postencode_sample is not OmniDataTransform.postencode_sample
+        pre_encode_sample = transform_type.pre_encode_sample is not OmniDataTransform.pre_encode_sample
+        post_encode_sample = transform_type.post_encode_sample is not OmniDataTransform.post_encode_sample
 
-        if encode_sample and (preencode_sample or postencode_sample):
+        if encode_sample and (pre_encode_sample or post_encode_sample):
             raise TypeError(
                 f"{type(transform).__name__} cannot combine encode_sample with "
-                "preencode_sample or postencode_sample"
+                "pre_encode_sample or post_encode_sample"
             )
 
-        if preencode_sample and not postencode_sample:
+        if pre_encode_sample and not post_encode_sample:
             raise TypeError(
-                f"{type(transform).__name__} must pair preencode_sample with postencode_sample"
+                f"{type(transform).__name__} must pair pre_encode_sample with post_encode_sample"
             )
 
-        if not encode_sample and not postencode_sample:
+        if not encode_sample and not post_encode_sample:
             raise TypeError(
-                f"{type(transform).__name__} must implement encode_sample or postencode_sample"
+                f"{type(transform).__name__} must implement encode_sample or post_encode_sample"
             )
 
         # encode_sample                     -> encode before candidate selection
-        # preencode_sample + postencode_sample -> prepare metadata, then defer full encoding
-        # postencode_sample only            -> preserve offline metadata, then defer encoding
+        # pre_encode_sample + post_encode_sample -> prepare metadata, then defer full encoding
+        # post_encode_sample only            -> preserve offline metadata, then defer encoding
         sample_encoder = None
-        if preencode_sample:
-            sample_encoder = transform.preencode_sample
+        if pre_encode_sample:
+            sample_encoder = transform.pre_encode_sample
         elif encode_sample:
             sample_encoder = transform.encode_sample
 
         selected_sample_encoder = None
-        if postencode_sample:
-            selected_sample_encoder = transform.postencode_sample
+        if post_encode_sample:
+            selected_sample_encoder = transform.post_encode_sample
 
         transform_strategy = cls(
             sample_encoder=sample_encoder,
@@ -572,7 +599,11 @@ class _OmniTransformStrategy:
         return encoded_sample
 
     def prepare_samples(self, raw_sample: Any) -> list[Any]:
-        """Return encoded, preencoded, or unchanged samples for candidate selection."""
+        """Return encoded, preencoded, or unchanged samples for candidate selection.
+
+        Args:
+            raw_sample: Source record before transform encoding.
+        """
         prepared_sample = raw_sample
         if self.sample_encoder is not None:
             prepared_sample = self.sample_encoder(raw_sample)

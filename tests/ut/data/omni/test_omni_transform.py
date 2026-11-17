@@ -278,6 +278,30 @@ class TestOmniTools(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_right_truncation_preserves_multiturn_supervision(self) -> None:
+        """Keep tool-call supervision and only the retained prefix of a long final answer.
+
+        Feature: Omni right truncation.
+        Description: Cut a multimodal tool conversation inside its final assistant answer.
+        Expectation: Earlier answer masks and media survive; the final answer is shortened.
+        """
+        self.messages[1]["content"] = [{"type": "image", "image": 21},
+                                       {"type": "text", "text": "USER_QUERY"}]
+        sample = {"messages": self.messages, "tools": self.tools}
+        transform = AutoProcessorTransform(processor=self.processor, max_seq_len=4096,
+                                           thinking_mode="auto", tools_key="tools")
+        full = transform.encode_sample(sample)
+        transform.max_seq_len = len(full["input_ids"]) - len("ANSWER</assistant>")
+        result = transform.encode_sample(sample)
+        expected = ("CALL_REASON\n</think>\n\n<tool_call>CALL_ARGUMENT</tool_call></assistant>"
+                    "FINAL_")
+        self.assertEqual(self.supervised(result["labels"]), expected)
+        for field in ("input_ids", "labels", "mm_token_type_ids"):
+            self.assertEqual(result[field].tolist(), full[field][:transform.max_seq_len].tolist())
+        self.assertEqual(result["pixel_values"].tolist(), [21])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_invalid_tools_fail_in_both_transforms(self) -> None:
         """Malformed JSON, scalar schemas, and invalid tools keys fail explicitly.
 

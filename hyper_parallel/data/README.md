@@ -198,11 +198,11 @@ DataLoader owner 读取 batch
 | 模式 | 实现 hook | 候选池之前 | 选中之后 |
 | --- | --- | --- | --- |
 | Eager Online | `encode_sample` | 完整 encode | 原样返回 |
-| Deferred Online | `preencode_sample` + `postencode_sample` | 只生成 planning metadata | 完整 encode |
-| Offline metadata | `postencode_sample` | 保留已有 metadata | 完成 encode |
+| Deferred Online | `pre_encode_sample` + `post_encode_sample` | 只生成 planning metadata | 完整 encode |
+| Offline metadata | `post_encode_sample` | 保留已有 metadata | 完成 encode |
 
-禁止同时实现 `encode_sample` 和 `preencode_sample/postencode_sample`。只有
-`preencode_sample` 而没有 `postencode_sample` 也属于无效组合。
+禁止同时实现 `encode_sample` 和 `pre_encode_sample/post_encode_sample`。只有
+`pre_encode_sample` 而没有 `post_encode_sample` 也属于无效组合。
 
 `encode_batch` 是最终 batch adapter：它在 packing/collate 之后把通用字段转换为模型 forward contract。
 例如 DeepSeek-V4.1 在这里将图片 patch length 转换为 offset，并生成 image-to-batch 映射。

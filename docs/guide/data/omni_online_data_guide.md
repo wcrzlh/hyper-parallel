@@ -179,7 +179,7 @@ Qwen2-VL Causal LM 在计算 loss 时处理位移。transform 返回单条样本
 2. 继承 `OmniDataTransform` 并实现 `encode_sample()`；至少返回同长度的 `input_ids`、`labels`，
    其中不参与 loss 的 token 为 `-100`。图片、视频等字段应与模型 forward 的参数名称、形状一致。
    若需要先按轻量元数据选择样本，再做昂贵的媒体编码，可改用成对的
-   `preencode_sample()` / `postencode_sample()`；如需 batch 级整理，可实现 `encode_batch()`。
+   `pre_encode_sample()` / `post_encode_sample()`；如需 batch 级整理，可实现 `encode_batch()`。
 3. 将 YAML 的 `dataset.model_assets`、`dataset.data_transform` 改为新目标。若 TP/CP 传输后还需构造
    模型专用位置、mask 或图片映射，在 `dataloader.get_batch.runtime_input_adapter` 配置模型 adapter；
    普通 processor 字段无需该 hook。

@@ -77,14 +77,26 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_processor_labels_and_length(self):
-        """Final assistant is supervised; overlong media samples are not sliced."""
+        """Right truncation aligns token fields and labels while retaining media inputs.
+
+        Feature: Omni sequence length limits.
+        Description: Encode the same sample with full and truncated token limits.
+        Expectation: Token fields stay aligned and samples without targets are rejected.
+        """
         transform = AutoProcessorTransform(max_seq_len=5, processor=FakeProcessor())
         sample = {"messages": [{"role": "user", "content": "image"}, {"role": "assistant", "content": "answer"}]}
         result = transform.encode_sample(sample)
         self.assertEqual(result["labels"].tolist(), [-100, -100, -100, 4, 5])
         self.assertEqual(tuple(result["pixel_values"].shape), (2, 3))
-        with self.assertRaisesRegex(ValueError, "exceeds max_seq_len"):
-            AutoProcessorTransform(max_seq_len=4, processor=FakeProcessor()).encode_sample(sample)
+        truncated = AutoProcessorTransform(max_seq_len=4, processor=FakeProcessor()).encode_sample(sample)
+        self.assertEqual(truncated["input_ids"].tolist(), [1, 2, 3, 4])
+        self.assertEqual(truncated["labels"].tolist(), [-100, -100, -100, 4])
+        self.assertEqual(truncated["attention_mask"].tolist(), [1, 1, 1, 1])
+        self.assertEqual(truncated["mm_token_type_ids"].tolist(), [0, 1, 0, 0])
+        for field in ("pixel_values", "image_grid_thw"):
+            self.assertTrue(torch.equal(truncated[field], result[field]))
+        with self.assertRaisesRegex(ValueError, "no supervised assistant tokens"):
+            AutoProcessorTransform(max_seq_len=3, processor=FakeProcessor()).encode_sample(sample)
         with self.assertRaisesRegex(ValueError, "final assistant"):
             transform.encode_sample({"messages": sample["messages"][:-1]})
 
@@ -92,7 +104,12 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_processor_masks_merged_boundary_without_changing_inputs(self):
-        """Empty thinking preserves image expansion and masks the shared newline token."""
+        """Empty thinking preserves image expansion and masks the shared newline token.
+
+        Feature: Assistant supervision at merged token boundaries.
+        Description: Encode an empty thinking span with a shared newline token.
+        Expectation: Mask the shared token and preserve native processor inputs.
+        """
         processor = BoundaryMergeProcessor()
         transform = AutoProcessorTransform(max_seq_len=16, processor=processor)
         messages = [{"role": "user", "content": "image"}, {"role": "assistant", "content": "answer"}]
@@ -108,7 +125,12 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_processor_rejects_real_rewrites_and_lossy_decoding(self):
-        """Text rewrites and changed expanded tokens must not be hidden by the fallback."""
+        """Text rewrites and changed expanded tokens must not be hidden by the fallback.
+
+        Feature: Lossless assistant boundary matching.
+        Description: Change prompt text or expanded tokens before boundary matching.
+        Expectation: Reject rewritten or lossy prompts with explicit errors.
+        """
         sample = {"messages": [{"role": "user"}, {"role": "assistant"}]}
         cases = (("prompt_text", "changed", "text prefix"),
                  ("prompt_tokens", [1, 7, 2, 3, 198], "lossless text"),
@@ -124,7 +146,12 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_processor_rejects_no_targets_after_boundary_masking(self):
-        """A merge consuming all remaining tokens does not create a supervised answer."""
+        """A merge consuming all remaining tokens does not create a supervised answer.
+
+        Feature: Supervised target validation.
+        Description: Mask a merged boundary that consumes all remaining tokens.
+        Expectation: Reject the sample because no supervised target remains.
+        """
         processor = BoundaryMergeProcessor()
         processor.full_tokens = [1, 2, 2, 3, 271]
         sample = {"messages": [{"role": "user"}, {"role": "assistant"}]}

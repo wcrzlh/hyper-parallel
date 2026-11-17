@@ -32,10 +32,10 @@ This module hosts the Omni data lifecycle for Kimi on top of the shared
   path used by the packing loader because the candidate cost can be derived
   from the encoded ``input_ids``.
 * :class:`KimiPackingOmniTransform` implements the deferred hooks
-  (``preencode_sample`` + ``postencode_sample``) for pipelines that must select
-  candidates before the final per-sample encoding. ``preencode_sample`` renders
+  (``pre_encode_sample`` + ``post_encode_sample``) for pipelines that must select
+  candidates before the final per-sample encoding. ``pre_encode_sample`` renders
   the conversation once and reports its exact ``packing_length``;
-  ``postencode_sample`` then applies length truncation. Sequence padding is left
+  ``post_encode_sample`` then applies length truncation. Sequence padding is left
   to the packing collator, because packing concatenates whole samples.
 
 Both wrappers delegate the actual rendering to :class:`KimiVLMChatTransform`,
@@ -521,8 +521,8 @@ class KimiVLMChatTransform:
         return self._truncate_and_pad(sample)
 
 
-# The Omni hook set (``encode_sample`` / ``preencode_sample`` /
-# ``postencode_sample``) is intentionally split across the subclasses, so the
+# The Omni hook set (``encode_sample`` / ``pre_encode_sample`` /
+# ``post_encode_sample``) is intentionally split across the subclasses, so the
 # shared base leaves them unimplemented on purpose.
 class _KimiOmniTransformBase(OmniDataTransform):  # pylint: disable=abstract-method
     """Bind the Kimi renderer to the shared Omni transform lifecycle."""
@@ -636,21 +636,29 @@ class KimiOmniTransform(_KimiOmniTransformBase):  # pylint: disable=abstract-met
 class KimiPackingOmniTransform(_KimiOmniTransformBase):  # pylint: disable=abstract-method
     """Deferred Kimi-K2.x Omni transform for packing pipelines.
 
-    ``preencode_sample`` renders the conversation exactly once and attaches the
+    ``pre_encode_sample`` renders the conversation exactly once and attaches the
     exact ``packing_length`` used by the packing selector, while
-    ``postencode_sample`` applies length truncation after selection. Padding is
+    ``post_encode_sample`` applies length truncation after selection. Padding is
     intentionally *not* applied per sample: the packing path concatenates whole
     samples and pads only the packed window.
     """
 
-    def preencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Render one conversation and report its exact packing length."""
+    def pre_encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Render one conversation and report its exact packing length.
+
+        Args:
+            sample: Source conversation to render before packing selection.
+        """
         rendered = self.chat_transform._render(self._prepare_record(sample))  # pylint: disable=protected-access
         rendered["packing_length"] = int(rendered["input_ids"].shape[0])
         return rendered
 
-    def postencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Truncate one selected sample to ``max_seq_len`` without padding."""
+    def post_encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Truncate one selected sample to ``max_seq_len`` without padding.
+
+        Args:
+            sample: Rendered conversation selected for packing.
+        """
         rendered = {field: value for field, value in sample.items() if field != "packing_length"}
         return self.chat_transform._truncate(rendered)  # pylint: disable=protected-access
 
@@ -684,7 +692,7 @@ def build_kimi_omni_transform(
             patch-unit budget.
         truncate_mode: Truncation policy for samples longer than ``max_seq_len``,
             ``"proportional"`` (default) or ``"head"``.
-        deferred: Return the deferred ``preencode_sample``/``postencode_sample``
+        deferred: Return the deferred ``pre_encode_sample``/``post_encode_sample``
             transform instead of the eager ``encode_sample`` one. Use it when the
             pipeline must select packing candidates before the final encoding.
         training_mode: SFT is the supported Kimi conversation objective.
