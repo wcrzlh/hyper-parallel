@@ -27,6 +27,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeAtten
 
 from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
 from hyper_parallel.distributed.context_parallel import packed_attention as packed
+from tests.common.mark_utils import arg_mark
 
 
 def _reference_varlen(module, query, key, value, attention_mask, **kwargs):
@@ -47,7 +48,13 @@ def _reference_varlen(module, query, key, value, attention_mask, **kwargs):
 class TestPackedAttention(unittest.TestCase):
     """Compare outputs and all Q/K/V gradients to one global document mask."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_forward_backward_across_cp_cuts(self):
+        """Feature: Packed attention across CP cuts.
+
+        Description: Compare local fragments against a global document mask.
+        Expectation: Outputs and gradients match the reference.
+        """
         torch.manual_seed(17)
         length = 32
         # Include exact cuts, tiny documents, and a document spanning all ranks.
@@ -84,6 +91,7 @@ class TestPackedAttention(unittest.TestCase):
                     for original, copied in zip(inputs, copies):
                         torch.testing.assert_close(copied.grad, original.grad, atol=1e-12, rtol=1e-12)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_ulysses_global_boundaries_and_gradients(self):
         """Feature: Packed Ulysses attention.
 
@@ -135,6 +143,7 @@ class TestPackedAttention(unittest.TestCase):
                     torch.testing.assert_close(copied.grad[:, :, right:],
                                                torch.zeros_like(copied.grad[:, :, right:]), atol=0, rtol=0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_reject_dense_mask_and_inconsistent_metadata(self):
         """Feature: Packed attention input validation.
 
@@ -143,6 +152,7 @@ class TestPackedAttention(unittest.TestCase):
         """
         mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1)
         module = SimpleNamespace(packed_attention_cp_mesh=mesh, is_causal=True)
+        tensor = torch.zeros(1, 2, 8, 4)
         for forward in (packed.packed_allgather_attention_forward, packed.packed_ulysses_attention_forward):
             with self.subTest(forward=forward.__name__):
                 with self.assertRaisesRegex(ValueError, "no dense mask"):
@@ -161,6 +171,7 @@ class TestPackedAttention(unittest.TestCase):
                 cu_seq_lens_q=(0, 16), cu_seq_lens_k=(0, 16),
             )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_hf_interface_forwards_boundaries_without_building_mask(self):
         """Feature: Packed HF attention interface.
 

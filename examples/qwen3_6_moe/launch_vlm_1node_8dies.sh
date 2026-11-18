@@ -20,6 +20,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 
+CONFIG_FILE=${CONFIG_FILE:-${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_moe/recipes/train_online_vlm.yaml}
+
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 RDZV_ID=${RDZV_ID:-qwen3_6_moe_vlm_1node_8dies}
@@ -36,5 +38,5 @@ torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module scripts.train_vl \
-    "${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_moe/recipes/train_online_vlm.yaml" \
+    "${CONFIG_FILE}" \
     "$@"

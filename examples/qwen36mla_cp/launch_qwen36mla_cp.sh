@@ -30,8 +30,9 @@ export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
 
 NPROC=${NPROC:-16}
-# Select train_online_packing.yaml for packed documents, or train_online.yaml for Ulysses.
-CONFIG_FILE=${CONFIG_FILE:-${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_mla/recipes/train_online_p2p_kv_allgather.yaml}
+# MLA and native checkpoints share the Qwen3.6 recipes. For P2P packing select
+# train_online_p2p_kv_allgather_packing.yaml; train_online_packing.yaml uses Ulysses.
+CONFIG_FILE=${CONFIG_FILE:-${PROJECT_ROOT}/hyper_parallel/models/qwen3_6_moe/recipes/train_online_p2p_kv_allgather.yaml}
 
 cd "${PROJECT_ROOT}"
 torchrun \

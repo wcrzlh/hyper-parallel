@@ -7,11 +7,13 @@
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
+  pretrained_model_name_or_path: /path/to/model
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
+  # Honor the checkpoint architecture, including local MLA remote code.
+  trust_remote_code: true
   config_overrides:
     use_cache: false
 
@@ -43,7 +45,6 @@ fsdp_config:
   mix_precision:
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
   edp_shard_size: 4
   # Tiny GDN parameters stay replicated to avoid per-parameter all-gathers.
   replicate_params:
@@ -133,10 +134,10 @@ dataset:
       preserve_thinking: true
     tokenizer:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
+      pretrained_model_name_or_path: /path/to/model
       local_files_only: true
       use_fast: true
-      trust_remote_code: false
+      trust_remote_code: true
   data_transform:
     _target_: hyper_parallel.data.text.text_transform.build_text_transform
     data_type: sharegpt
@@ -145,7 +146,7 @@ dataset:
     # Also bounds each packed micro-batch before CP slicing.
     max_seq_len: 32768
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  data_path: /home/chaoran/datasets/decif-30k.jsonl
+  data_path: /path/to/dataset.jsonl
   data_config:
     dataset_type: mapping
     hf_dataset_name: null

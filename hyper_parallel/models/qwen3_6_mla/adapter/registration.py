@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Adapters for the Qwen3.6 MLA model family (Qwen3_6MLAForCausalLM).
+"""Adapters for the Qwen3.6 MLA language and vision-language model family.
 
 Qwen3.6 MLA is a hybrid decoder: interleaved full-attention layers with
 KV-latent (MLA) compression and GatedDeltaNet linear-attention layers, plus
@@ -20,12 +20,14 @@ fine-grained MoE feed-forward blocks. The family adapter contributes the
 context-parallel wrappers that intercept ``F.scaled_dot_product_attention``
 (``sdpa_hf_ulysses``) and the GDN primitives (``gdn_ulysses``).
 
-The chunked-CE training objective is resolved through the generic
-``qwen3_5_moe_text`` adapter path, so no model-specific loss adapter is
-registered here.
+The text objective is resolved through ``qwen3_5_moe_text``. The visual
+architecture reuses the native Qwen3.5-MoE VLM adapter providers.
 """
 
+from dataclasses import replace
+
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5_moe.adapter.registration import QWEN3_5_MOE_ADAPTER_SPEC
 from hyper_parallel.models.registry import register_model_adapter
 
 
@@ -58,3 +60,15 @@ QWEN3_6_MLA_ADAPTER_SPEC = ModelAdapterSpec(
 )
 
 register_model_adapter(QWEN3_6_MLA_ADAPTER_SPEC)
+
+# Retain the VLM's materialization, loss and FSDP execution contracts. Its
+# architecture must not resolve to the text-only MLA spec through a family alias.
+QWEN3_6_MLA_VLM_ADAPTER_SPEC = replace(
+    QWEN3_5_MOE_ADAPTER_SPEC,
+    architecture="Qwen3_6MLAForConditionalGeneration",
+    model_type="qwen36_moe_mla_vl",
+    context_parallel=_load_context_parallel,
+    sharding_rules=_load_sharding_rules,
+)
+
+register_model_adapter(QWEN3_6_MLA_VLM_ADAPTER_SPEC)
