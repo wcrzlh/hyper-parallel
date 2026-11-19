@@ -148,7 +148,7 @@ dataloader:
   data_sharding: false
   drop_last: true
   use_background_prefetcher: false
-  num_workers: 0
+  num_workers: 32
   pin_memory: false
   prefetch_factor: null
 
