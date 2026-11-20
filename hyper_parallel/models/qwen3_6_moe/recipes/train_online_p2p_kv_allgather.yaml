@@ -1,7 +1,7 @@
 # Eight-rank Qwen3.6 MoE: FSDP + EP + GDN P2P + attention KV all-gather CP.
 
 model:
-  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.models.qwen3_5_moe.adapter.lm.build_qwen_lm
   pretrained_model_name_or_path: /path/to/model
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
@@ -68,7 +68,7 @@ plan_overrides:
       exact_type: true
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
-  - match: "*.mlp.forward"
+  - match: "*.layers.*.mlp.forward"
     when: ep
     replace:
       kind: method

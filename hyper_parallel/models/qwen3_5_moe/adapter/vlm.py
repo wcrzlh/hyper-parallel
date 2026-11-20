@@ -15,19 +15,16 @@
 """Model-owned forward installation for Qwen dense and MoE VLM CP."""
 
 from contextlib import nullcontext
-from dataclasses import replace
-from fnmatch import fnmatchcase
 from functools import partial, wraps
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
-from transformers import AutoConfig, AutoModelForImageTextToText
+from transformers import AutoModelForImageTextToText
 
-from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature
-from hyper_parallel.distributed.recipe_spec import CP, EP, ModuleShardingSpec
 from hyper_parallel.models import HyperAutoModelForImageTextToText
+from hyper_parallel.models.qwen3_5_moe.adapter.model_setup import prepare_remote_model_setup
 from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMCPInputs
 from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
 from hyper_parallel.models.qwen3_5_moe.adapter.dummy_vision import (
@@ -177,41 +174,6 @@ def install_qwen_vlm_cp_forward(model: Any, *, cp_enabled: bool = True) -> None:
     model._hp_qwen_vlm_forward_installed = True  # pylint: disable=protected-access
 
 
-def _resolve_remote_vlm_replacement(rule: Any, reference: Any) -> Any:
-    """Resolve the checkpoint's exact class for one native Qwen replacement."""
-    source = rule.module_type
-    if source is None or not source.__module__.startswith("transformers.models.qwen3_5_moe."):
-        return rule
-    types = {type(module) for name, module in reference.named_modules()
-             if any(fnmatchcase(name, pattern) for pattern in rule.match)}
-    if len(types) != 1 or next(iter(types)).__name__ != source.__name__:
-        raise ValueError(f"MLA module replacement does not resolve one {source.__name__}: {rule.match}")
-    return replace(rule, module_type=next(iter(types)))
-
-
-def _prepare_remote_vlm_setup(model_path: str, distributed_setup: Any, options: dict[str, Any]) -> None:
-    """Resolve MLA checkpoint classes without weakening shared exact-type rules."""
-    if distributed_setup is None or not options.get("trust_remote_code", False):
-        return
-    load_options = {key: options[key] for key in ("trust_remote_code", "local_files_only", "revision", "cache_dir")
-                    if key in options}
-    config = AutoConfig.from_pretrained(model_path, **load_options)
-    if "Qwen3_6MLAForConditionalGeneration" not in (config.architectures or ()):
-        return
-    with torch.device("meta"):
-        reference = AutoModelForImageTextToText.from_config(config, trust_remote_code=True, dtype=torch.bfloat16)
-    distributed_setup.module_replacements = tuple(
-        _resolve_remote_vlm_replacement(rule, reference) for rule in distributed_setup.module_replacements or ()
-    )
-    # The remote vision classes are not HF planner boundaries. Declare their
-    # decoder-CP/EP replication explicitly while retaining FSDP ownership.
-    for name, module in reference.model.visual.named_modules():
-        params = {key: {CP: Replicate(), EP: Replicate()} for key, _ in module.named_parameters(recurse=False)}
-        if params:
-            fqn = "model.visual" + ("." + name if name else "")
-            distributed_setup.plan_overrides.setdefault(fqn, ModuleShardingSpec(params=params))
-
-
 def build_qwen_vlm(pretrained_model_name_or_path: str, *, distributed_setup: Any = None,
                    **kwargs: Any) -> Any:
     """Build a Qwen VLM and install its CP forward independently of batching.
@@ -224,7 +186,9 @@ def build_qwen_vlm(pretrained_model_name_or_path: str, *, distributed_setup: Any
     Returns:
         The model-owned batch adapter, retaining the native forward for CP=1.
     """
-    _prepare_remote_vlm_setup(pretrained_model_name_or_path, distributed_setup, kwargs)
+    prepare_remote_model_setup(
+        pretrained_model_name_or_path, distributed_setup, kwargs, auto_model_class=AutoModelForImageTextToText,
+    )
     model = HyperAutoModelForImageTextToText.from_pretrained(
         pretrained_model_name_or_path, distributed_setup=distributed_setup, **kwargs,
     )

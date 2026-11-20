@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from torch import nn
 
-from hyper_parallel.models.qwen3_5_moe.adapter import vlm
+from hyper_parallel.models.qwen3_5_moe.adapter import model_setup, vlm
 from hyper_parallel.models.replacement import ModuleReplacementSpec, compile_module_replacements, module_replacement
 from tests.common.mark_utils import arg_mark
 
@@ -44,10 +44,13 @@ class TestSharedVLMSetup(unittest.TestCase):
         """
         rules = (object(),)
         setup = SimpleNamespace(module_replacements=rules, plan_overrides={})
-        with patch.object(vlm.AutoConfig, "from_pretrained", return_value=SimpleNamespace(
+        with patch.object(model_setup.AutoConfig, "from_pretrained", return_value=SimpleNamespace(
                 architectures=["Qwen3_5MoeForConditionalGeneration"])), patch.object(
                 vlm.AutoModelForImageTextToText, "from_config") as build:
-            vlm._prepare_remote_vlm_setup("local-model", setup, {"trust_remote_code": True})
+            model_setup.prepare_remote_model_setup(
+                "local-model", setup, {"trust_remote_code": True},
+                auto_model_class=vlm.AutoModelForImageTextToText,
+            )
         self.assertIs(setup.module_replacements, rules)
         build.assert_not_called()
         self.assertEqual(setup.plan_overrides, {})
@@ -69,10 +72,13 @@ class TestSharedVLMSetup(unittest.TestCase):
         rule = ModuleReplacementSpec(("model.linear_attn",), _identity_factory, native, True)
         custom_visual = object()
         setup = SimpleNamespace(module_replacements=(rule,), plan_overrides={"model.visual": custom_visual})
-        with patch.object(vlm.AutoConfig, "from_pretrained", return_value=SimpleNamespace(
+        with patch.object(model_setup.AutoConfig, "from_pretrained", return_value=SimpleNamespace(
                 architectures=["Qwen3_6MLAForConditionalGeneration"])), patch.object(
                 vlm.AutoModelForImageTextToText, "from_config", return_value=reference):
-            vlm._prepare_remote_vlm_setup("local-model", setup, {"trust_remote_code": True})
+            model_setup.prepare_remote_model_setup(
+                "local-model", setup, {"trust_remote_code": True},
+                auto_model_class=vlm.AutoModelForImageTextToText,
+            )
         resolved = setup.module_replacements[0]
         self.assertIs(resolved.module_type, remote)
         self.assertTrue(resolved.exact_type)
