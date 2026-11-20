@@ -52,15 +52,15 @@ plan_overrides:
   - match: "model.language_model.layers.*.linear_attn"
     replace:
       kind: module
-      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
-      exact_type: true
+      source_type: torch.nn.Module
+      exact_type: false
       implementation:
         _target_: hyper_parallel.components.modules.TritonGDN
   - match: "model.language_model.layers.*.mlp.experts"
     replace:
       kind: module
-      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts
-      exact_type: true
+      source_type: torch.nn.Module
+      exact_type: false
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
   - match: "model.language_model.layers.*.mlp.forward"
