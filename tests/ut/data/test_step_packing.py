@@ -79,6 +79,38 @@ class TestStepPacking(unittest.TestCase):
     """A step changes its computation schedule without changing source membership."""
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_equal_count_kk_balances_cost_without_changing_membership(self):
+        """Feature: Equal-count DP assignment.
+        Description: Balance skewed costs and cover feasible equal-size partitions.
+        Expectation: Counts remain equal, membership is exact and the fixture's peak cost falls.
+        """
+        groups = balanced_step_partitions([10, 9, 1, 1], 2, workloads=[100, 90, 10, 10], equal_size=True)
+        self.assertEqual(sorted(sum([100, 90, 10, 10][i] for i in group) for group in groups), [100, 110])
+        rng = random.Random(42)
+        for ranks in range(1, 9):
+            for per_rank in range(1, 9):
+                lengths = [rng.randint(1, 32768) for _ in range(ranks * per_rank)]
+                groups = balanced_step_partitions(lengths, ranks, equal_size=True)
+                self.assertEqual([len(group) for group in groups], [per_rank] * ranks)
+                self.assertEqual(sorted(index for group in groups for index in group), list(range(len(lengths))))
+                self.assertEqual(groups, balanced_step_partitions(lengths, ranks, equal_size=True))
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            balanced_step_partitions([1, 2, 3], 2, equal_size=True)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_unequal_dp_source_counts_fail_on_non_readers_too(self):
+        """Feature: Collective-safe DP balancing validation.
+        Description: A TP non-reader observes unequal source counts in other ranks.
+        Expectation: Reject the input before any payload or model collective.
+        """
+        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", return_value=[0, -1, 1, 2]):
+            with self.assertRaisesRegex(ValueError, "equal source sample counts"):
+                prepare_token_batch_step(
+                    None, device="cpu", drop_last=True, num_micro_batches=1, step_packing=True,
+                    mesh=SimpleNamespace(dp_size=2),
+                )
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_model_workloads_reach_partitioner_and_preserve_samples(self):
         """Use model costs while retaining bounded packs and source membership.
 
@@ -115,8 +147,9 @@ class TestStepPacking(unittest.TestCase):
         for costs in ([1], [1, 0]):
             with self.assertRaisesRegex(ValueError, "Workloads"):
                 balanced_step_partitions([2, 3], 1, workloads=costs)
-        with self.assertRaisesRegex(ValueError, "plan_version"):
-            validate_packing_checkpoint({"step_packing_plan_version": 1}, 32768)
+        for version in (1, 2):
+            with self.assertRaisesRegex(ValueError, "plan_version"):
+                validate_packing_checkpoint({"step_packing_plan_version": version}, 32768)
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_budget_can_require_more_than_total_length_lower_bound(self):
@@ -190,7 +223,7 @@ class TestStepPacking(unittest.TestCase):
         Expectation: The local rank emits the globally agreed micro-batch count.
         """
         step = PackingStep(make_samples([2, 2, 2, 2]), TextPackingCollator(), 6)
-        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", side_effect=[[0, -4, 3], [0]]):
+        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", side_effect=[[0, -4, 3, 4], [0]]):
             iterator, count = prepare_token_batch_step(
                 iter([step]), device="cpu", drop_last=True, num_micro_batches=1, step_packing=True,
             )
@@ -204,7 +237,7 @@ class TestStepPacking(unittest.TestCase):
         Description: A TP non-reader joins the partition metadata reductions.
         Expectation: It receives the common count without emitting source batches.
         """
-        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", side_effect=[[0, -4, 2], [0]]):
+        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", side_effect=[[0, -4, 2, 4], [0]]):
             iterator, count = prepare_token_batch_step(
                 None, device="cpu", drop_last=True, num_micro_batches=1, step_packing=True,
             )
@@ -221,7 +254,7 @@ class TestStepPacking(unittest.TestCase):
         step = PackingStep(make_samples([11]), TextPackingCollator(), 10)
         with self.assertRaisesRegex(ValueError, "Invalid step packing"):
             prepare_token_batch_step(iter([step]), device="cpu", drop_last=True, num_micro_batches=1, step_packing=True)
-        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", return_value=[1, -1, 1]):
+        with patch("hyper_parallel.trainer.runtime.dynamic_epoch._global_max", return_value=[1, -1, 1, 1]):
             with self.assertRaisesRegex(ValueError, "source rank"):
                 prepare_token_batch_step(None, device="cpu", drop_last=True, num_micro_batches=1, step_packing=True)
 
@@ -324,7 +357,7 @@ class TestStepPacking(unittest.TestCase):
                 trainer.base = SimpleNamespace(
                     train_dataloader=make_loader(make_samples([9, 9, 9, 9, 2, 2, 2, 2])),
                     num_micro_batches=1, device="cpu", train_steps=2, train_iters=2,
-                    model_config=SimpleNamespace(model_type="fixture"),
+                    model_config=SimpleNamespace(model_type="fixture"), mesh=None,
                     state=SimpleNamespace(global_step=0),
                     config=SimpleNamespace(dataloader=SimpleNamespace(step_packing=True, drop_last=True)),
                 )

@@ -337,6 +337,7 @@ class TextTrainer:
                         device=self.base.device, drop_last=self.base.config.dataloader.drop_last,
                         step_packing=getattr(self.base.config.dataloader, "step_packing", False),
                         model_config=self.base.model_config,
+                        mesh=self.base.mesh,
                     )
                 self.train_step(step_iterator)
             except StopIteration:

@@ -24,7 +24,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 
 
-PACKING_PLAN_VERSION = 2
+PACKING_PLAN_VERSION = 3
 
 
 def validate_step_packing_length(max_seq_len: int | None, collate_fn: Any) -> None:
@@ -43,6 +43,7 @@ def validate_step_packing_length(max_seq_len: int | None, collate_fn: Any) -> No
 
 def balanced_step_partitions(
     lengths: Sequence[int], num_partitions: int, *, workloads: Sequence[int] | None = None,
+    equal_size: bool = False,
 ) -> list[list[int]]:
     """Balance indivisible samples using multiway Karmarkar-Karp differencing.
 
@@ -55,6 +56,7 @@ def balanced_step_partitions(
         lengths: Positive encoded lengths in source order.
         num_partitions: Number of nonempty groups to construct.
         workloads: Optional positive per-sample computation estimates.
+        equal_size: Require equal sample counts for cross-DP assignment.
     """
     if not 1 <= num_partitions <= len(lengths) or any(length <= 0 for length in lengths):
         raise ValueError("Partitions must be nonempty and sample lengths positive")
@@ -64,12 +66,8 @@ def balanced_step_partitions(
         return [list(range(len(lengths)))]
     if workloads is None:
         workloads = [24576 * length + length * length for length in lengths]
-    heap = []
-    serial = 0
-    for index, cost in enumerate(workloads):
-        groups = [(cost, (index,))] + [(0, ())] * (num_partitions - 1)
-        heapq.heappush(heap, (-cost, serial, groups))
-        serial += 1
+    heap = _partition_heap(workloads, num_partitions, equal_size)
+    serial = len(heap)
     while len(heap) > 1:
         _, _, left = heapq.heappop(heap)
         _, _, right = heapq.heappop(heap)
@@ -82,6 +80,23 @@ def balanced_step_partitions(
     partitions = [list(indices) for _, indices in heap[0][2]]
     partitions.sort(key=lambda group: (sum(workloads[index] for index in group), group[0]), reverse=True)
     return partitions[::2][::-1] + partitions[1::2]
+
+
+def _partition_heap(workloads: Sequence[int], num_partitions: int, equal_size: bool) -> list:
+    """Seed equal-count KK with one sample per group in each initial state."""
+    if equal_size and len(workloads) % num_partitions:
+        raise ValueError("Equal-size partitions require the sample count to be divisible by the partition count")
+    heap = []
+    items = list(enumerate(workloads))
+    width = num_partitions if equal_size else 1
+    if equal_size:
+        items.sort(key=lambda item: (item[1], item[0]))
+    for serial, offset in enumerate(range(0, len(items), width)):
+        groups = [(cost, (index,)) for index, cost in items[offset:offset + width]]
+        groups.extend([(0, ())] * (num_partitions - width))
+        groups.sort(reverse=True)
+        heapq.heappush(heap, (-(groups[0][0] - groups[-1][0]), serial, groups))
+    return heap
 
 
 @dataclass

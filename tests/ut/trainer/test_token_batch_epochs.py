@@ -86,7 +86,7 @@ def _trainer(config, lengths, limit, snapshot=None):
         optimizer.load_state_dict(snapshot["optimizer"])
     trainer.base = SimpleNamespace(
         config=config, train_dataloader=loader, state=state, train_iters=limit, train_steps=limit,
-        model_config=None,
+        model_config=None, mesh=None,
         train_epochs=1, num_micro_batches=2, device="cpu", local_rank=0,
         optimizer=optimizer, abort_profilers=Mock(), destroy_distributed=Mock(),
     )

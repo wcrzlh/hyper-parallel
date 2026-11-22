@@ -25,6 +25,7 @@ import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 from hyper_parallel.data.batching import TokenBatchLoader
 from hyper_parallel.data.batching.step_packing import PackingStep, balanced_step_partitions
 from hyper_parallel.trainer.runtime.flops import estimate_packing_workloads
+from hyper_parallel.trainer.runtime.step_balance import balance_packing_step
 
 
 def uses_token_batch_loader(config: Any) -> bool:
@@ -52,14 +53,15 @@ def uses_source_epoch(config: Any) -> bool:
 
 def prepare_token_batch_step(
     data_iterator: Any, *, num_micro_batches: int, device: Any, drop_last: bool, step_packing: bool = False,
-    model_config: Any = None,
+    model_config: Any = None, mesh: Any = None,
 ) -> tuple[Iterator[Any], int]:
     """Stage one complete CPU step and agree on EOF before broadcasting model inputs.
 
     Non-reader TP ranks pass None. At optimizer-step checkpoints all staged
     batches have been consumed, so the existing source cursor plus packing
     buffer remains the complete data state. Step packing reads one source step,
-    then partitions it within max_seq_len and agrees on the computation count.
+    balances equal sample counts across DP, then partitions within max_seq_len
+    and agrees on the computation count.
     With drop_last, the shortest DP shard bounds the epoch; other shards'
     remaining packs are omitted.
 
@@ -70,6 +72,7 @@ def prepare_token_batch_step(
         drop_last: Whether incomplete optimizer steps are discarded.
         step_packing: Whether to partition one complete source step.
         model_config: Resolved HF configuration for packing workload estimates.
+        mesh: Trainer topology for equal-count DP balancing before local packing.
 
     Returns:
         The micro-batch iterator and the forward/backward count for this step.
@@ -89,7 +92,9 @@ def prepare_token_batch_step(
             )
         raise StopIteration
     if step_packing:
-        return _partition_packing_step(batches[0] if batches else None, device=device, model_config=model_config)
+        return _partition_packing_step(
+            batches[0] if batches else None, device=device, model_config=model_config, mesh=mesh,
+        )
     return iter(batches), num_micro_batches
 
 
@@ -102,9 +107,25 @@ def _global_max(values: list[int], device: Any) -> list[int]:
 
 
 def _partition_packing_step(
-    step: PackingStep | None, *, device: Any, model_config: Any = None,
+    step: PackingStep | None, *, device: Any, model_config: Any = None, mesh: Any = None,
 ) -> tuple[Iterator[Any], int]:
     """Agree on nonempty bounded partitions before any model collectives."""
+    step, lengths, workloads, count, max_count = _prepare_packing_metadata(
+        step, device=device, model_config=model_config, mesh=mesh,
+    )
+    while 1 <= count <= max_count:
+        partitions = balanced_step_partitions(lengths, count, workloads=workloads) if lengths else []
+        exceeds = any(sum(lengths[index] for index in group) > step.max_seq_len for group in partitions)
+        if not _global_max([int(exceeds)], device)[0]:
+            return (step.batches(partitions) if step is not None else iter(())), count
+        count += 1
+    raise ValueError("Cannot fit this step within max_seq_len with the same nonempty micro-batch count on every rank")
+
+
+def _prepare_packing_metadata(
+    step: PackingStep | None, *, device: Any, model_config: Any, mesh: Any,
+) -> tuple[PackingStep | None, list[int], list[int] | None, int, int]:
+    """Validate collectively, balance DP ownership, then derive the common K lower bound."""
     lengths = []
     workloads = None
     error = None
@@ -117,17 +138,17 @@ def _partition_packing_step(
         except (TypeError, ValueError, AttributeError) as exc:
             error = exc
     initial_count = (sum(lengths) + step.max_seq_len - 1) // step.max_seq_len if lengths else 0
-    invalid, negative_min_samples, count = _global_max(
-        [int(error is not None), -len(lengths) if step is not None else -(2 ** 60), initial_count], device,
+    invalid, negative_min_samples, count, max_samples = _global_max(
+        [int(error is not None), -len(lengths) if step is not None else -(2 ** 60), initial_count, len(lengths)],
+        device,
     )
     if invalid:
         detail = error or "see source rank error"
         raise ValueError(f"Invalid step packing samples on a source rank: {detail}") from error
-    max_count = -negative_min_samples
-    while 1 <= count <= max_count:
-        partitions = balanced_step_partitions(lengths, count, workloads=workloads) if lengths else []
-        exceeds = any(sum(lengths[index] for index in group) > step.max_seq_len for group in partitions)
-        if not _global_max([int(exceeds)], device)[0]:
-            return (step.batches(partitions) if step is not None else iter(())), count
-        count += 1
-    raise ValueError("Cannot fit this step within max_seq_len with the same nonempty micro-batch count on every rank")
+    if mesh is not None and mesh.dp_size > 1:
+        if max_samples != -negative_min_samples:
+            raise ValueError("Cross-DP step packing requires equal source sample counts on every DP rank")
+        step, lengths, workloads = balance_packing_step(step, lengths, workloads, mesh=mesh, device=device)
+        initial_count = (sum(lengths) + step.max_seq_len - 1) // step.max_seq_len if lengths else 0
+        count = _global_max([initial_count], device)[0]
+    return step, lengths, workloads, count, -negative_min_samples
