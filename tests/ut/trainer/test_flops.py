@@ -19,6 +19,7 @@ import unittest
 
 from hyper_parallel.trainer.runtime.flops import estimate_flops_per_token
 from hyper_parallel.trainer.runtime.flops import estimate_step_flops
+from hyper_parallel.trainer.runtime.flops import estimate_packing_workloads
 from tests.common.mark_utils import arg_mark
 
 
@@ -49,6 +50,71 @@ def qwen3_moe_config(**overrides: object) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def qwen35_moe_config(layers: int = 40, **overrides: object) -> SimpleNamespace:
+    """Describe the GQA 35B-A3B architecture without loading model assets."""
+    values = {
+        "model_type": "qwen3_5_moe_text", "hidden_size": 2048, "num_hidden_layers": layers,
+        "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256,
+        "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_conv_kernel_dim": 4,
+        "num_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512, "vocab_size": 248320,
+    }
+    values["layer_types"] *= layers // 4
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestPackingWorkloads(unittest.TestCase):
+    """Check architecture-derived weights separately from the partition heuristic."""
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_40_layer_cost_and_full_recomputation(self):
+        """Match the independently derived 40-layer principal-GEMM totals.
+
+        Feature: Model-aware packing workload estimation.
+        Description: Estimate four sequence lengths with full recomputation.
+        Expectation: Costs match the independently derived 40-layer formula.
+        """
+        lengths = [65, 4096, 32768, 131072]
+        config = qwen35_moe_config()
+        actual = estimate_packing_workloads(config, lengths)
+        self.assertEqual(actual, [327680 * (70938 * size + size * size) for size in lengths])
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_depth_changes_decoder_but_not_lm_head(self):
+        """Doubling decoder depth must not duplicate vocabulary projection work.
+
+        Feature: Architecture-derived packing costs.
+        Description: Compare 20-layer, 40-layer, and wrapped text configurations.
+        Expectation: Only decoder cost scales with depth; wrappers preserve cost.
+        """
+        length = 4096
+        shallow = estimate_packing_workloads(qwen35_moe_config(20), [length])[0]
+        deep = estimate_packing_workloads(qwen35_moe_config(40), [length])[0]
+        self.assertEqual(2 * shallow - deep, 3051356160 * length)
+        wrapped = SimpleNamespace(text_config=qwen35_moe_config(40))
+        self.assertEqual(estimate_packing_workloads(wrapped, [length]), [deep])
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_active_experts_and_unsupported_models(self):
+        """Charge active experts, retaining legacy handling for other architectures.
+
+        Feature: Packing estimator applicability.
+        Description: Vary active experts, model family, compression, and layer types.
+        Expectation: Expert costs scale correctly; unsupported models fall back.
+        """
+        normal = estimate_packing_workloads(qwen35_moe_config(), [64])[0]
+        fewer = estimate_packing_workloads(qwen35_moe_config(num_experts_per_tok=7), [64])[0]
+        self.assertEqual(normal - fewer, 1006632960 * 64)
+        self.assertIsNone(estimate_packing_workloads(SimpleNamespace(model_type="llama"), [64]))
+        mla = qwen35_moe_config(kv_compression={"enabled": True, "mode": "mla"})
+        self.assertIsNone(estimate_packing_workloads(mla, [64]))
+        with self.assertRaisesRegex(ValueError, "layer_type"):
+            estimate_packing_workloads(qwen35_moe_config(layer_types=[]), [64])
 
 
 class TestEstimateFlopsPerToken(unittest.TestCase):

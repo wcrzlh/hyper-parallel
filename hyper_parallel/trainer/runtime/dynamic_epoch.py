@@ -24,17 +24,26 @@ import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.batching import TokenBatchLoader
 from hyper_parallel.data.batching.step_packing import PackingStep, balanced_step_partitions
+from hyper_parallel.trainer.runtime.flops import estimate_packing_workloads
 
 
 def uses_token_batch_loader(config: Any) -> bool:
-    """Identify the configured loader also on TP ranks that own no dataset."""
+    """Identify the configured loader also on TP ranks that own no dataset.
+
+    Args:
+        config: Trainer configuration containing the loader target.
+    """
     loader = getattr(config, "dataloader", None)
     target = getattr(getattr(loader, "target", None), "callable", None)
     return isinstance(target, type) and issubclass(target, TokenBatchLoader)
 
 
 def uses_source_epoch(config: Any) -> bool:
-    """Identify loaders that agree on source exhaustion before each step."""
+    """Identify loaders that agree on source exhaustion before each step.
+
+    Args:
+        config: Trainer configuration containing the loader and packing mode.
+    """
     loader_config = getattr(config, "dataloader", None)
     step_packing = bool(getattr(loader_config, "step_packing", False))
     requires_source_epoch_sync = uses_token_batch_loader(config) or step_packing
@@ -43,6 +52,7 @@ def uses_source_epoch(config: Any) -> bool:
 
 def prepare_token_batch_step(
     data_iterator: Any, *, num_micro_batches: int, device: Any, drop_last: bool, step_packing: bool = False,
+    model_config: Any = None,
 ) -> tuple[Iterator[Any], int]:
     """Stage one complete CPU step and agree on EOF before broadcasting model inputs.
 
@@ -59,6 +69,7 @@ def prepare_token_batch_step(
         device: Device used for distributed metadata reductions.
         drop_last: Whether incomplete optimizer steps are discarded.
         step_packing: Whether to partition one complete source step.
+        model_config: Resolved HF configuration for packing workload estimates.
 
     Returns:
         The micro-batch iterator and the forward/backward count for this step.
@@ -78,7 +89,7 @@ def prepare_token_batch_step(
             )
         raise StopIteration
     if step_packing:
-        return _partition_packing_step(batches[0] if batches else None, device=device)
+        return _partition_packing_step(batches[0] if batches else None, device=device, model_config=model_config)
     return iter(batches), num_micro_batches
 
 
@@ -90,15 +101,19 @@ def _global_max(values: list[int], device: Any) -> list[int]:
     return tensor.tolist()
 
 
-def _partition_packing_step(step: PackingStep | None, *, device: Any) -> tuple[Iterator[Any], int]:
+def _partition_packing_step(
+    step: PackingStep | None, *, device: Any, model_config: Any = None,
+) -> tuple[Iterator[Any], int]:
     """Agree on nonempty bounded partitions before any model collectives."""
     lengths = []
+    workloads = None
     error = None
     if step is not None:
         try:
             if not isinstance(step, PackingStep):
                 raise ValueError("step_packing loader must yield a PackingStep")
             lengths = step.sample_lengths()
+            workloads = estimate_packing_workloads(model_config, lengths)
         except (TypeError, ValueError, AttributeError) as exc:
             error = exc
     initial_count = (sum(lengths) + step.max_seq_len - 1) // step.max_seq_len if lengths else 0
@@ -110,7 +125,7 @@ def _partition_packing_step(step: PackingStep | None, *, device: Any) -> tuple[I
         raise ValueError(f"Invalid step packing samples on a source rank: {detail}") from error
     max_count = -negative_min_samples
     while 1 <= count <= max_count:
-        partitions = balanced_step_partitions(lengths, count) if lengths else []
+        partitions = balanced_step_partitions(lengths, count, workloads=workloads) if lengths else []
         exceeds = any(sum(lengths[index] for index in group) > step.max_seq_len for group in partitions)
         if not _global_max([int(exceeds)], device)[0]:
             return (step.batches(partitions) if step is not None else iter(())), count

@@ -29,6 +29,7 @@ from hyper_parallel.trainer.config.data import DataLoaderConfig
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.runtime.dynamic_epoch import prepare_token_batch_step
 from hyper_parallel.trainer.text_trainer import TextTrainer
+from tests.common.mark_utils import arg_mark
 
 
 text_module = importlib.import_module("hyper_parallel.trainer.text_trainer")
@@ -85,6 +86,7 @@ def _trainer(config, lengths, limit, snapshot=None):
         optimizer.load_state_dict(snapshot["optimizer"])
     trainer.base = SimpleNamespace(
         config=config, train_dataloader=loader, state=state, train_iters=limit, train_steps=limit,
+        model_config=None,
         train_epochs=1, num_micro_batches=2, device="cpu", local_rank=0,
         optimizer=optimizer, abort_profilers=Mock(), destroy_distributed=Mock(),
     )
@@ -125,6 +127,7 @@ def _snapshot(trainer):
 class TestTokenBatchEpochs(unittest.TestCase):
     """Use real stateful loader checkpoints with a deterministic CPU optimizer."""
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_multiple_epochs_and_resume_match_uninterrupted(self):
         """
         Feature: Source-preserving step packing.
@@ -157,11 +160,19 @@ class TestTokenBatchEpochs(unittest.TestCase):
                 self.assertEqual(prefix.losses + suffix.losses, uninterrupted.losses)
                 torch.testing.assert_close(suffix.weight, uninterrupted.weight, rtol=0, atol=0)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_incomplete_epoch_fails_instead_of_looping(self):
+        """Fail when an epoch cannot supply an optimizer step.
+
+        Feature: Token loader epoch termination.
+        Description: Train with fewer source samples than a complete step needs.
+        Expectation: Raise ValueError rather than repeating an empty epoch.
+        """
         trainer = _trainer(_config(), [[3]], 3)
         with self.assertRaisesRegex(ValueError, "complete distributed optimizer step"):
             _run(trainer)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_partial_step_is_rejected_before_forward(self):
         """
         Feature: Source-preserving step packing.

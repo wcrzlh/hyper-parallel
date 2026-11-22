@@ -16,12 +16,69 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Optional, Tuple
 
 # Qwen3-MoE always projects its dense MLP and every routed expert through three
 # GEMMs (gate, up, down). ``hidden_act`` only selects the elementwise activation
 # applied to the gate branch, so it must not change the projection count.
 _GATED_FFN_PROJECTIONS = 3.0
+
+
+def estimate_packing_workloads(config: Any, lengths: Sequence[int]) -> list[int] | None:
+    """Estimate Qwen3.5/3.6 GQA-MoE text work for local packing partitions.
+
+    Always assume full recomputation: four forward equivalents per decoder
+    layer and three for the LM head. Use one a*L + b*L**2 proxy per model,
+    independent of runtime checkpoint settings. Principal GEMMs include GDN
+    with chunk size 64 and causal varlen attention. Auxiliary operations,
+    chunk/tile padding, communication, vision and MTP work are not modeled.
+
+    Args:
+        config: Resolved HF model config, optionally containing text_config.
+        lengths: Encoded document lengths before packing and CP slicing.
+
+    Returns:
+        Per-document integer costs, or None for unsupported architectures.
+        Remote KV-compression models retain the caller's legacy heuristic.
+    """
+    config = getattr(config, "text_config", config)
+    if getattr(config, "model_type", None) != "qwen3_5_moe_text":
+        return None
+    compression = getattr(config, "kv_compression", None) or {}
+    if compression.get("enabled", False):
+        return None
+    if any(length <= 0 for length in lengths):
+        raise ValueError("Packing workload requires positive document lengths")
+    hidden = int(config.hidden_size)
+    query = int(config.num_attention_heads) * int(config.head_dim)
+    key_value = int(config.num_key_value_heads) * int(config.head_dim)
+    key_dim = int(config.linear_key_head_dim)
+    value_dim = int(config.linear_value_head_dim)
+    value_heads = int(config.linear_num_value_heads)
+    keys = int(config.linear_num_key_heads) * key_dim
+    values = value_heads * value_dim
+    layers = int(config.num_hidden_layers)
+    layer_types = config.layer_types[:layers]
+    if len(layer_types) != layers or any(kind not in ("linear_attention", "full_attention") for kind in layer_types):
+        raise ValueError("Packing workload requires one supported layer_type per decoder layer")
+    full_layers = layer_types.count("full_attention")
+    gdn_layers = layers - full_layers
+
+    # Qwen's Q projection produces both queries and the output gate.
+    attention = 2 * hidden * (3 * query + 2 * key_value)
+    experts = 2 * hidden * (
+        3 * (int(config.num_experts_per_tok) * int(config.moe_intermediate_size)
+             + int(config.shared_expert_intermediate_size)) + int(config.num_experts) + 1
+    )
+    gdn = 2 * hidden * (2 * keys + 3 * values + 2 * value_heads)
+    gdn += 2 * (2 * keys + values) * int(config.linear_conv_kernel_dim)
+    # KK^T, A@K, A@V, W@state, K^T@V, Q@state, QK^T and attention@V.
+    chunk = 2 * value_heads * (3 * key_dim * value_dim + 64 * (3 * key_dim + 2 * value_dim))
+    linear = (4 * (full_layers * attention + gdn_layers * (gdn + chunk) + layers * experts)
+              + 6 * hidden * int(config.vocab_size))
+    quadratic = 8 * full_layers * query
+    return [linear * length + quadratic * length * length for length in lengths]
 
 
 def _qwen3_moe_coefficients(config: Any) -> Optional[Tuple[float, float]]:

@@ -27,7 +27,9 @@ import torch
 from hyper_parallel.data.batching.build_collate_fn import OmniCollator, TextPackingCollator
 from hyper_parallel.data.batching.build_dataloader import FixedBatchDataLoader, TokenBatchLoader, OmniPackingLoader
 from hyper_parallel.data.batching.packing import SamplePacker
-from hyper_parallel.data.batching.step_packing import PackingStep, balanced_step_partitions
+from hyper_parallel.data.batching.step_packing import (
+    PackingStep, balanced_step_partitions, validate_packing_checkpoint,
+)
 from hyper_parallel.data.parallel.batch_sampler import build_dataset_batch_sampler
 from hyper_parallel.trainer.runtime.dynamic_epoch import prepare_token_batch_step
 from hyper_parallel.trainer.text_trainer import TextTrainer
@@ -73,10 +75,50 @@ class OmniSamples(list):
         return batch
 
 
-@arg_mark(["cpu_linux"], "level0", "onecard", "essential")
 class TestStepPacking(unittest.TestCase):
     """A step changes its computation schedule without changing source membership."""
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_model_workloads_reach_partitioner_and_preserve_samples(self):
+        """Use model costs while retaining bounded packs and source membership.
+
+        Feature: Model-aware step packing.
+        Description: Pass model workloads through step preparation into KK.
+        Expectation: Packs respect the budget and retain every source token.
+        """
+        samples = make_samples([7, 3, 5, 3])
+        config = SimpleNamespace(model_type="fixture")
+        with patch("hyper_parallel.trainer.runtime.dynamic_epoch.estimate_packing_workloads",
+                   return_value=[90, 30, 50, 30]) as estimate:
+            with patch("hyper_parallel.trainer.runtime.dynamic_epoch.balanced_step_partitions",
+                       wraps=balanced_step_partitions) as partition:
+                iterator, count = prepare_token_batch_step(
+                    iter(make_loader(samples)), device="cpu", drop_last=True, num_micro_batches=1,
+                    step_packing=True, model_config=config,
+                )
+                batches = list(iterator)
+        estimate.assert_called_once_with(config, [7, 3, 5, 3])
+        self.assertEqual(partition.call_args.kwargs["workloads"], [90, 30, 50, 30])
+        self.assertEqual(len(batches), count)
+        self.assertTrue(all(batch["input_ids"].shape[1] <= 10 for batch in batches))
+        tokens = torch.cat([batch["input_ids"].flatten() for batch in batches])
+        self.assertEqual([int((tokens == identity).sum()) for identity in range(1, 5)], [7, 3, 5, 3])
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_partition_cost_validation_and_checkpoint_version(self):
+        """Reject invalid costs and old plans instead of silently changing replay.
+
+        Feature: Packing plan validation.
+        Description: Supply invalid workload arrays and an obsolete plan version.
+        Expectation: Invalid costs and incompatible checkpoints raise ValueError.
+        """
+        for costs in ([1], [1, 0]):
+            with self.assertRaisesRegex(ValueError, "Workloads"):
+                balanced_step_partitions([2, 3], 1, workloads=costs)
+        with self.assertRaisesRegex(ValueError, "plan_version"):
+            validate_packing_checkpoint({"step_packing_plan_version": 1}, 32768)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_budget_can_require_more_than_total_length_lower_bound(self):
         """
         Feature: Source-preserving step packing.
@@ -92,6 +134,7 @@ class TestStepPacking(unittest.TestCase):
         self.assertEqual(count, 3)
         self.assertEqual(sorted(batch["input_ids"].shape[1] for batch in batches), [6, 6, 6])
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_alignment_labels_and_document_boundaries(self):
         """
         Feature: Source-preserving step packing.
@@ -122,6 +165,7 @@ class TestStepPacking(unittest.TestCase):
         self.assertEqual(sorted(seen), [1, 2, 3, 4])
         self.assertEqual(target_count, sum(int((sample["labels"] != -100).sum()) for sample in samples))
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_partitions_are_complete_deterministic_and_nonempty(self):
         """
         Feature: Source-preserving step packing.
@@ -138,6 +182,7 @@ class TestStepPacking(unittest.TestCase):
                 self.assertTrue(all(groups))
                 self.assertEqual(sorted(index for group in groups for index in group), list(range(size)))
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_remote_rank_increases_common_count(self):
         """
         Feature: Source-preserving step packing.
@@ -152,6 +197,7 @@ class TestStepPacking(unittest.TestCase):
             self.assertEqual(count, 3)
             self.assertEqual(len(list(iterator)), 3)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_non_reader_participates_in_plan(self):
         """
         Feature: Source-preserving step packing.
@@ -165,6 +211,7 @@ class TestStepPacking(unittest.TestCase):
             self.assertEqual(count, 2)
             self.assertEqual(list(iterator), [])
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_source_error_is_agreed_before_forward(self):
         """
         Feature: Source-preserving step packing.
@@ -178,6 +225,7 @@ class TestStepPacking(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source rank"):
                 prepare_token_batch_step(None, device="cpu", drop_last=True, num_micro_batches=1, step_packing=True)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_drop_last_applies_to_source_steps(self):
         """
         Feature: Source-preserving step packing.
@@ -193,6 +241,7 @@ class TestStepPacking(unittest.TestCase):
         with self.assertRaises(StopIteration):
             prepare_token_batch_step(source, device="cpu", drop_last=True, num_micro_batches=1, step_packing=True)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_resume_same_grouping_with_workers_and_legacy_cursor(self):
         """
         Feature: Source-preserving step packing.
@@ -233,6 +282,7 @@ class TestStepPacking(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "max_seq_len"):
                         wrong_budget.load_state_dict(state)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_omni_preserves_media_and_encodes_each_sample_once(self):
         """
         Feature: Source-preserving step packing.
@@ -261,6 +311,7 @@ class TestStepPacking(unittest.TestCase):
             self.assertEqual(sorted(int(row[0]) for batch in batches for row in batch["pixel_values"]), [1, 2, 3, 4])
             self.assertEqual(sum(int((batch["labels"] != -100).sum()) for batch in batches), 14)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_trainers_read_one_step_even_when_previous_micro_count_changes(self):
         """
         Feature: Source-preserving step packing.
@@ -273,6 +324,7 @@ class TestStepPacking(unittest.TestCase):
                 trainer.base = SimpleNamespace(
                     train_dataloader=make_loader(make_samples([9, 9, 9, 9, 2, 2, 2, 2])),
                     num_micro_batches=1, device="cpu", train_steps=2, train_iters=2,
+                    model_config=SimpleNamespace(model_type="fixture"),
                     state=SimpleNamespace(global_step=0),
                     config=SimpleNamespace(dataloader=SimpleNamespace(step_packing=True, drop_last=True)),
                 )
@@ -290,6 +342,7 @@ class TestStepPacking(unittest.TestCase):
                 self.assertEqual(counts, [4, 1])
                 self.assertEqual(trainer.base.state.global_step, 2)
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_budget_validation_and_nonpacking_compatibility(self):
         """
         Feature: Source-preserving step packing.

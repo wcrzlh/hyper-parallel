@@ -24,7 +24,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 
 
-PACKING_PLAN_VERSION = 1
+PACKING_PLAN_VERSION = 2
 
 
 def validate_step_packing_length(max_seq_len: int | None, collate_fn: Any) -> None:
@@ -41,22 +41,29 @@ def validate_step_packing_length(max_seq_len: int | None, collate_fn: Any) -> No
         raise ValueError("step_packing max_seq_len must be divisible by the collator's TP * CP alignment")
 
 
-def balanced_step_partitions(lengths: Sequence[int], num_partitions: int) -> list[list[int]]:
+def balanced_step_partitions(
+    lengths: Sequence[int], num_partitions: int, *, workloads: Sequence[int] | None = None,
+) -> list[list[int]]:
     """Balance indivisible samples using multiway Karmarkar-Karp differencing.
 
-    Like verl's sequence balancer, use 24576 * L + L**2 as a workload proxy.
+    Use model-derived workloads when available, otherwise retain the legacy
+    verl proxy for model families without an analytical estimate.
     The caller checks the actual token budget separately: balanced workloads
     do not imply bounded token sums. Ties use source indices deterministically.
 
     Args:
         lengths: Positive encoded lengths in source order.
         num_partitions: Number of nonempty groups to construct.
+        workloads: Optional positive per-sample computation estimates.
     """
     if not 1 <= num_partitions <= len(lengths) or any(length <= 0 for length in lengths):
         raise ValueError("Partitions must be nonempty and sample lengths positive")
+    if workloads is not None and (len(workloads) != len(lengths) or min(workloads, default=0) <= 0):
+        raise ValueError("Workloads must contain one positive cost per sample")
     if num_partitions == 1:
         return [list(range(len(lengths)))]
-    workloads = [24576 * length + length * length for length in lengths]
+    if workloads is None:
+        workloads = [24576 * length + length * length for length in lengths]
     heap = []
     serial = 0
     for index, cost in enumerate(workloads):
